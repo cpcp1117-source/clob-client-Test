@@ -13,43 +13,33 @@ import * as fs from "fs";
 dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
 
 // ============================================
-// 🎛️ 策略配置 (2024/03/31 優化版)
+// 🎛️ 策略配置
 // ============================================
 const CONFIG = {
     // 資金管理
     INITIAL_BALANCE: 50,           // 初始本金 $50
-    STANDARD_MULTIPLIER: 0.8,      // 標準倉位 = 本金/5 * 0.8 (降低單筆風險)
-    DEFENSIVE_MULTIPLIER: 0.3,     // 防禦倉位 = 本金/5 * 0.3 (更保守)
+    STANDARD_MULTIPLIER: 1.0,      // 標準倉位 = 本金/5 * 1.0
+    DEFENSIVE_MULTIPLIER: 0.5,     // 防禦倉位 = 本金/5 * 0.5 
     
-    // 策略參數 - 核心優化
-    HIGH_PROB_THRESHOLD: 0.86,     // 86% 勝率門檻（避免剛好 85% 的邊界情況）
-    MAX_PROB_THRESHOLD: 0.94,      // ⚠️ 新增：最高入場門檻（>94% 不入場，風險報酬比太差）
-    CONSECUTIVE_HITS: 4,           // 連續達標次數（4次更快進場但仍有確認）
+    // 策略參數
+    HIGH_PROB_THRESHOLD: 0.85,     // 85% 高勝率門檻
+    CONSECUTIVE_HITS: 5,           // 連續達標次數
     MAX_LATENCY: 500,              // 最大延遲 ms
     
-    // 價格穩定性檢查 - 防止在波動中入場
-    PRICE_STABILITY_CHECK: true,   // ⚠️ 新增：啟用價格穩定性檢查
-    MAX_PRICE_VOLATILITY: 0.03,    // ⚠️ 新增：3秒內波動超過3%則跳過
-    
     // 停損機制
-    STOP_LOSS_THRESHOLD: 0.1,     // 價格下跌 10% 觸發停損 (例: 100% → 90%)
-    COOLDOWN_MS: 3000,             // 停損後冷卻時間 3 秒
-    MIN_REBUY_PROB: 0.85,          // 冷卻後重新買入最低勝率
+    STOP_LOSS_THRESHOLD: 0.13,     // 價格下跌 13% 觸發停損 (放寬以容忍波動)
+    STOP_LOSS_CONFIRM_COUNT: 3,    // 需連續 N 次低於閾值才觸發停損
+    STOP_LOSS_HOLD_SECONDS: 5,     // 最後 N 秒不執行停損（只保護最後5秒）
+    REBUY_WAIT_UNTIL_SECONDS: 5,   // 停損後等到最後 N 秒才能重新下單
+    MIN_REBUY_PROB: 0.85,          // 重新買入最低勝率 85%
     STABLE_PRICE_TOLERANCE: 0.02,  // 價格穩定容忍度
-    MAX_STOP_LOSS_PER_ROUND: 1,    // 每輪最多停損次數（超過後本輪不再入場）
+    MAX_REBUY_PER_ROUND: 1,        // 每輪最多重新下單次數
     
-    // 對沖機制 - 優化版
-    HEDGE_ENABLED: true,           // 啟用對沖
-    HEDGE_BASE_RATIO: 0.15,        // 基準對沖比例 (15%，降低成本)
-    HEDGE_MIN_RATIO: 0.05,         // 最小對沖比例 (5%)
-    HEDGE_MAX_RATIO: 0.25,         // 最大對沖比例 (25%，降低上限)
-    HEDGE_DISABLE_ABOVE: 0.92,     // ⚠️ 新增：價格 >92% 時停用對沖（對沖方成本太高）
-    
-    // 時間視窗 (秒) - 優化版
-    MONITORING_START: 40,          // 監控期開始 (剩餘40秒) - 稍微延後，讓價格更穩定
-    MONITORING_END: 12,            // 監控期結束 (剩餘12秒)
-    FINAL_DECISION_TIME: 6,        // 最後決策時間點 (剩餘6秒) - 更保守
-    LOCK_TIME: 4,                  // 鎖定期 (剩餘4秒以下)
+    // 時間視窗 (秒)
+    MONITORING_START: 30,          // 監控期開始 (剩餘30秒)
+    MONITORING_END: 15,            // 監控期結束 (剩餘15秒)
+    FINAL_DECISION_TIME: 6,        // 最後決策時間點 (剩餘6秒)
+    LOCK_TIME: 5,                  // 鎖定期 (剩餘5秒以下)
     
     // 結算
     SETTLEMENT_DELAY: 10000,       // 結算等待時間 ms
@@ -94,32 +84,27 @@ interface SimulatorState {
     priceUpdateCount: number;
     lastPriceUpdate: number;
     
-    // 價格歷史（用於波動性計算）
-    priceHistory: Array<{ up: number; down: number; timestamp: number }>;
-    
     // 策略狀態
     consecutiveHighProb: { up: number; down: number };
     currentRoundOrder: SimulatedOrder | null;
     finalDecisionMade: boolean; // 本輪是否已做最後決策
+    delayedEntry: boolean; // 是否為開盤勝率過高延遲進場
+    delayedEntryMade: boolean; // 是否已執行延遲進場判斷
     
     // 停損相關
     currentPosition: { side: "UP" | "DOWN"; entryPrice: number; amount: number } | null;
-    cooldownUntil: number; // 冷卻結束時間戳
-    stopLossCount: number; // 本輪停損次數
+    stopLossTriggered: boolean; // 本輪是否已觸發停損
+    rebuyCount: number; // 本輪重新下單次數
+    stopLossConfirmCount: number; // 連續低於停損閾值的次數
     
     // 統計
     totalRounds: number;
     wins: number;
     losses: number;
     skipped: number;
-}
-
-interface HedgeOrder {
-    id: string;
-    side: "UP" | "DOWN";
-    price: number;
-    amount: number;
-    potentialReturn: number;
+    stopLossCount: number; // 停損總次數
+    stopLossTotalAmount: number; // 停損總金額
+    totalWinAmount: number; // 總獲勝金額
 }
 
 interface SimulatedOrder {
@@ -133,7 +118,6 @@ interface SimulatedOrder {
     timestamp: Date;
     timeRemaining: number;
     finalPrices?: { up: number; down: number }; // 市場結束時的最終價格
-    hedgeOrder?: HedgeOrder;       // 對沖訂單
 }
 
 interface TradeRecord {
@@ -165,20 +149,24 @@ const state: SimulatorState = {
     priceUpdateCount: 0,
     lastPriceUpdate: 0,
     
-    priceHistory: [], // 價格歷史（最近 3 秒）
-    
     consecutiveHighProb: { up: 0, down: 0 },
     currentRoundOrder: null,
     finalDecisionMade: false,
+    delayedEntry: false,
+    delayedEntryMade: false,
     
     currentPosition: null,
-    cooldownUntil: 0,
-    stopLossCount: 0,
+    stopLossTriggered: false,
+    rebuyCount: 0,
+    stopLossConfirmCount: 0,
     
     totalRounds: 0,
     wins: 0,
     losses: 0,
     skipped: 0,
+    stopLossCount: 0,
+    stopLossTotalAmount: 0,
+    totalWinAmount: 0,
 };
 
 const tradeHistory: TradeRecord[] = [];
@@ -441,169 +429,63 @@ function calculateBetAmount(orderType: "STANDARD" | "DEFENSIVE"): number {
 }
 
 // ============================================
-// � 計算價格波動性（最近 3 秒）
-// ============================================
-function calculateVolatility(side: "UP" | "DOWN"): number {
-    if (!CONFIG.PRICE_STABILITY_CHECK) return 0;
-    
-    const now = Date.now();
-    const recentHistory = state.priceHistory.filter(p => now - p.timestamp < 3000);
-    
-    if (recentHistory.length < 2) return 0;
-    
-    const prices = recentHistory.map(p => side === "UP" ? p.up : p.down);
-    const maxPrice = Math.max(...prices);
-    const minPrice = Math.min(...prices);
-    
-    // 計算波動幅度（相對於均價）
-    const avgPrice = (maxPrice + minPrice) / 2;
-    if (avgPrice === 0) return 0;
-    
-    return (maxPrice - minPrice) / avgPrice;
-}
-
-// ============================================
-// 🔍 檢查是否適合入場
-// ============================================
-function shouldEnterTrade(price: number, side: "UP" | "DOWN"): { ok: boolean; reason?: string } {
-    // 檢查價格上限（風險報酬比太差）
-    if (price > CONFIG.MAX_PROB_THRESHOLD) {
-        return { ok: false, reason: `價格 ${(price * 100).toFixed(1)}% > ${CONFIG.MAX_PROB_THRESHOLD * 100}% 上限` };
-    }
-    
-    // 檢查價格下限
-    if (price < CONFIG.HIGH_PROB_THRESHOLD) {
-        return { ok: false, reason: `價格 ${(price * 100).toFixed(1)}% < ${CONFIG.HIGH_PROB_THRESHOLD * 100}% 門檻` };
-    }
-    
-    // 檢查波動性
-    if (CONFIG.PRICE_STABILITY_CHECK) {
-        const volatility = calculateVolatility(side);
-        if (volatility > CONFIG.MAX_PRICE_VOLATILITY) {
-            return { ok: false, reason: `波動過大 ${(volatility * 100).toFixed(1)}% > ${CONFIG.MAX_PRICE_VOLATILITY * 100}%` };
-        }
-    }
-    
-    return { ok: true };
-}
-
-// ============================================
-// 🔄 計算動態對沖比例
-// ============================================
-function calculateHedgeRatio(mainPrice: number): number {
-    if (!CONFIG.HEDGE_ENABLED) return 0;
-    
-    // ⚠️ 高價格時停用對沖（對沖方成本太高，划不來）
-    if (mainPrice > CONFIG.HEDGE_DISABLE_ABOVE) return 0;
-    
-    // 價格差距 = |主倉價格 - 對沖價格| = |mainPrice - (1-mainPrice)| = |2*mainPrice - 1|
-    const priceDiff = Math.abs(2 * mainPrice - 1);
-    
-    // 差距越大 → 對沖比例越低
-    // 差距 0.7 (85% vs 15%) → 對沖 = 15% * (1 - 0.7) = 4.5%
-    // 差距 0.2 (60% vs 40%) → 對沖 = 15% * (1 - 0.2) = 12%
-    let hedgeRatio = CONFIG.HEDGE_BASE_RATIO * (1 - priceDiff);
-    
-    // 限制在最小/最大範圍內
-    hedgeRatio = Math.max(CONFIG.HEDGE_MIN_RATIO, Math.min(CONFIG.HEDGE_MAX_RATIO, hedgeRatio));
-    
-    return hedgeRatio;
-}
-
-// ============================================
-// 🎯 模擬下單 (含對沖)
+// 🎯 模擬下單
 // ============================================
 function simulateOrder(
     side: "UP" | "DOWN",
     price: number,
     orderType: "STANDARD" | "DEFENSIVE",
-    timeRemaining: number,
-    prices: { up: number; down: number }
+    timeRemaining: number
 ): SimulatedOrder {
-    const totalAmount = calculateBetAmount(orderType);
-    const hedgeRatio = calculateHedgeRatio(price);
+    // ============================================
+    // 🌐 真實環境模擬機制 (Slippage & Taker Fees)
+    // ============================================
     
-    // 計算主倉和對沖金額
-    const mainAmount = Math.round(totalAmount * (1 - hedgeRatio) * 100) / 100;
-    const hedgeAmount = Math.round(totalAmount * hedgeRatio * 100) / 100;
+    // 1. 模擬 Taker 滑點：市價吃單會比最新報價差。機率越極端，訂單簿越薄，可能遇到更大滑點
+    const slippage = price >= 0.90 ? 0.003 : 0.001; 
+    const executionPrice = Math.min(price + slippage, 0.999);
+
+    // 2. 模擬 Taker 動態手續費 (Polymarket 新公式)
+    // 最高手續費約為 1.56% (出現在 50% 勝率)，在極端勝率會對稱遞減近乎 0
+    const peakFeeRate = 0.0156; 
+    const dynamicFeeRate = peakFeeRate * 4 * executionPrice * (1 - executionPrice);
     
-    const potentialReturn = mainAmount / price;
+    const rawBudget = calculateBetAmount(orderType);
+    const feeAmount = rawBudget * dynamicFeeRate;
+    const amountAfterFee = rawBudget - feeAmount; // 扣除強制繳納的手續費
+    const potentialReturn = amountAfterFee / executionPrice;
     
     const order: SimulatedOrder = {
         id: `SIM-${Date.now()}`,
         marketSlug: state.currentMarket?.slug || "unknown",
         side,
-        price,
-        amount: mainAmount,
+        price: executionPrice,
+        amount: rawBudget, // 從帳戶中實際扣減的總保證金
         potentialReturn,
         orderType,
         timestamp: new Date(),
         timeRemaining,
     };
     
-    // 建立對沖訂單
-    if (CONFIG.HEDGE_ENABLED && hedgeAmount > 0) {
-        const hedgeSide: "UP" | "DOWN" = side === "UP" ? "DOWN" : "UP";
-        const hedgePrice = side === "UP" ? prices.down : prices.up;
-        
-        order.hedgeOrder = {
-            id: `HEDGE-${Date.now()}`,
-            side: hedgeSide,
-            price: hedgePrice,
-            amount: hedgeAmount,
-            potentialReturn: hedgeAmount / hedgePrice,
-        };
-    }
-    
     console.log(`\n${"=".repeat(50)}`);
-    console.log(`🎯 模擬下單 [${orderType}] ${CONFIG.HEDGE_ENABLED ? "+ 對沖" : ""}`);
-    console.log(`   📈 主倉: ${side} @ ${(price * 100).toFixed(2)}% | $${mainAmount.toFixed(2)}`);
-    if (order.hedgeOrder) {
-        console.log(`   📉 對沖: ${order.hedgeOrder.side} @ ${(order.hedgeOrder.price * 100).toFixed(2)}% | $${hedgeAmount.toFixed(2)}`);
-        console.log(`   📊 比例: ${((1-hedgeRatio)*100).toFixed(0)}:${(hedgeRatio*100).toFixed(0)}`);
-    }
-    console.log(`   💰 總金額: $${totalAmount.toFixed(2)}`);
-    console.log(`   ⏱️ 剩餘時間: ${timeRemaining}s`);
+    console.log(`🎯 模擬下單 [${orderType}] (真實環境已考慮)`);
+    console.log(`   方向: ${side} (${outcomeLabels[side.toLowerCase() as "up" | "down"]})`);
+    console.log(`   觸發價: ${(price * 100).toFixed(2)}% | 執行價(含滑點): ${(executionPrice * 100).toFixed(2)}%`);
+    console.log(`   總資金: $${rawBudget.toFixed(2)} | 扣除手續費($${feeAmount.toFixed(4)}): $${amountAfterFee.toFixed(2)}`);
+    console.log(`   預期回報: $${potentialReturn.toFixed(2)}`);
+    console.log(`   剩餘時間: ${timeRemaining}s`);
     console.log(`${"=".repeat(50)}\n`);
     
     return order;
 }
 
 // ============================================
-// � 停損執行
+// 🚨 停損執行 (已廢棄，改由 processStrategy 直接處理)
 // ============================================
-function executeStopLoss(currentPrice: number): void {
-    if (!state.currentPosition) return;
-    
-    const { side, entryPrice, amount } = state.currentPosition;
-    
-    // 計算損失: 價格下跌比例 * 下注金額
-    const priceDrop = entryPrice - currentPrice;
-    const loss = (priceDrop / entryPrice) * amount;
-    
-    state.balance -= loss;
-    state.stopLossCount++;
-    state.cooldownUntil = Date.now() + CONFIG.COOLDOWN_MS;
-    
-    console.log(`\n${"⚠️".repeat(15)}`);
-    console.log(`🚨 觸發停損!`);
-    console.log(`   方向: ${side}`);
-    console.log(`   入場價: ${(entryPrice * 100).toFixed(2)}%`);
-    console.log(`   當前價: ${(currentPrice * 100).toFixed(2)}%`);
-    console.log(`   價格跌幅: ${((priceDrop / entryPrice) * 100).toFixed(2)}%`);
-    console.log(`   損失: -$${loss.toFixed(2)}`);
-    console.log(`   餘額: $${state.balance.toFixed(2)}`);
-    console.log(`   冷卻: ${CONFIG.COOLDOWN_MS / 1000}秒`);
-    console.log(`${"⚠️".repeat(15)}\n`);
-    
-    // 清除持倉
-    state.currentPosition = null;
-    state.currentRoundOrder = null;
-    state.tradingState = TradingState.COOLDOWN;
-}
+// 此函數不再使用，停損邏輯已整合到 processStrategy 中
 
 // ============================================
-// �📈 結算處理
+// 📈 結算處理
 // ============================================
 async function settleOrder(order: SimulatedOrder): Promise<void> {
     console.log(`\n⏳ 結算訂單: ${order.marketSlug.slice(-15)} (${order.side})`);
@@ -713,38 +595,22 @@ async function settleOrder(order: SimulatedOrder): Promise<void> {
         return;
     }
     
-    // 計算損益（含對沖）
-    const isMainWin = order.side === winner;
-    let profit = 0;
+    // 計算損益
+    const isWin = order.side === winner;
+    const profit = isWin 
+        ? order.potentialReturn - order.amount  // 獲利 = 回報 - 本金
+        : -order.amount;                         // 損失 = 全部下注金額
     
-    // 主倉損益
-    if (isMainWin) {
-        profit += order.potentialReturn - order.amount;
-    } else {
-        profit -= order.amount;
-    }
-    
-    // 對沖損益
-    if (order.hedgeOrder) {
-        const isHedgeWin = order.hedgeOrder.side === winner;
-        if (isHedgeWin) {
-            profit += order.hedgeOrder.potentialReturn - order.hedgeOrder.amount;
-        } else {
-            profit -= order.hedgeOrder.amount;
-        }
-    }
-    
-    // 更新餘額
+    // 更新餘額：勝利加獲利，失敗扣本金
     state.balance += profit;
     
-    const totalAmount = order.amount + (order.hedgeOrder?.amount || 0);
-    
-    if (profit > 0) {
+    if (isWin) {
         state.wins++;
-        console.log(`   🎉 獲利！結果: ${winner} | 淨利 +$${profit.toFixed(2)}`);
+        state.totalWinAmount += profit; // 累加獲勝金額
+        console.log(`   🎉 勝利！結果: ${winner} | 獲利 +$${profit.toFixed(2)}`);
     } else {
         state.losses++;
-        console.log(`   😞 虧損！結果: ${winner} | 淨損 -$${Math.abs(profit).toFixed(2)}`);
+        console.log(`   😞 失敗！結果: ${winner} | 損失 -$${order.amount.toFixed(2)}`);
     }
     
     console.log(`   目前餘額: $${state.balance.toFixed(2)}`);
@@ -756,8 +622,8 @@ async function settleOrder(order: SimulatedOrder): Promise<void> {
         side: order.side,
         orderType: order.orderType,
         entryPrice: order.price,
-        amount: order.amount + (order.hedgeOrder?.amount || 0),
-        result: profit > 0 ? "WIN" : "LOSS",
+        amount: order.amount,
+        result: isWin ? "WIN" : "LOSS",
         profit,
         balanceAfter: state.balance,
         timestamp: order.timestamp,
@@ -799,12 +665,6 @@ function displayStatus(prices: { up: number; down: number }, timeRemaining: numb
 function processStrategy(prices: { up: number; down: number }, timeRemaining: number) {
     state.lastPrices = prices;
     
-    // 記錄價格歷史（用於波動性計算）
-    const now = Date.now();
-    state.priceHistory.push({ up: prices.up, down: prices.down, timestamp: now });
-    // 只保留最近 5 秒的歷史
-    state.priceHistory = state.priceHistory.filter(p => now - p.timestamp < 5000);
-    
     // 跳過或結算中，不處理
     if (state.tradingState === TradingState.SKIPPED ||
         state.tradingState === TradingState.SETTLING) {
@@ -812,24 +672,39 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
         return;
     }
     
-    // 🚨 持倉中 - 監控停損 (已註解)
+    // 🚨 持倉中 - 監控停損
     if (state.tradingState === TradingState.HOLDING && state.currentPosition) {
-        // 停損功能已停用，直接等待結算
-        displayStatus(prices, timeRemaining);
-        return;
-        
-        /* 停損郏輯註解開始
         const { side, entryPrice } = state.currentPosition;
         const currentPrice = side === "UP" ? prices.up : prices.down;
         const priceDrop = entryPrice - currentPrice;
         const dropPercent = priceDrop / entryPrice;
         
-        // 檢查是否觸發停損
+        // 🛡️ 最後 N 秒不執行停損（快結算時波動無意義）
+        if (timeRemaining <= CONFIG.STOP_LOSS_HOLD_SECONDS) {
+            // 重置連續確認計數
+            state.stopLossConfirmCount = 0;
+            displayStatus(prices, timeRemaining);
+            return;
+        }
+        
+        // 檢查是否低於停損閾值
         if (dropPercent >= CONFIG.STOP_LOSS_THRESHOLD) {
+            // 增加連續確認計數
+            state.stopLossConfirmCount++;
+            
+            // 需要連續 N 次才真正觸發停損
+            if (state.stopLossConfirmCount < CONFIG.STOP_LOSS_CONFIRM_COUNT) {
+                console.log(`\n⚠️ 停損警告 (${state.stopLossConfirmCount}/${CONFIG.STOP_LOSS_CONFIRM_COUNT}): ${side} 跌幅 ${(dropPercent * 100).toFixed(2)}%`);
+                displayStatus(prices, timeRemaining);
+                return;
+            }
+            
             // 執行停損計算
             const loss = (priceDrop / entryPrice) * state.currentPosition.amount;
             state.balance -= loss;
-            state.stopLossCount++;
+            state.stopLossConfirmCount = 0; // 重置
+            state.stopLossCount++; // 統計停損次數
+            state.stopLossTotalAmount += loss; // 統計停損金額
             
             console.log(`\n${"⚠️".repeat(15)}`);
             console.log(`🚨 觸發停損!`);
@@ -838,73 +713,62 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             console.log(`   跌幅: ${(dropPercent * 100).toFixed(2)}%`);
             console.log(`   損失: -$${loss.toFixed(2)}`);
             console.log(`   餘額: $${state.balance.toFixed(2)}`);
-            console.log(`   本輪停損次數: ${state.stopLossCount}/${CONFIG.MAX_STOP_LOSS_PER_ROUND}`);
             
             // 清除持倉
             state.currentPosition = null;
             state.currentRoundOrder = null;
+            state.stopLossTriggered = true;
             
-            // 檢查是否達到本輪停損上限
-            if (state.stopLossCount >= CONFIG.MAX_STOP_LOSS_PER_ROUND) {
-                console.log(`   🚫 已達本輪停損上限，本輪不再入場`);
-                state.tradingState = TradingState.SKIPPED;
-            } else if (timeRemaining < CONFIG.LOCK_TIME) {
-                // 鎖定期停損後不再重新入場
-                console.log(`   🔒 鎖定期停損，本輪不再入場`);
+            // 檢查是否達到本輪重買上限
+            if (state.rebuyCount >= CONFIG.MAX_REBUY_PER_ROUND) {
+                console.log(`   🚫 已達本輪重買上限，本輪不再入場`);
                 state.tradingState = TradingState.SKIPPED;
             } else {
-                // 非鎖定期且未達上限，進入冷卻期
-                console.log(`   ❄️ 進入冷卻期 ${CONFIG.COOLDOWN_MS / 1000} 秒`);
-                state.cooldownUntil = Date.now() + CONFIG.COOLDOWN_MS;
+                // 等待最後5秒重新入場
+                console.log(`   ⏳ 等待最後 ${CONFIG.REBUY_WAIT_UNTIL_SECONDS} 秒重新入場機會`);
                 state.tradingState = TradingState.COOLDOWN;
             }
             console.log(`${"⚠️".repeat(15)}\n`);
             
             displayStatus(prices, timeRemaining);
             return;
+        } else {
+            // 價格回升，重置連續確認計數
+            if (state.stopLossConfirmCount > 0) {
+                state.stopLossConfirmCount = 0;
+            }
         }
         
         displayStatus(prices, timeRemaining);
         return;
-        停損郏輯註解結束 */
     }
     
-    // ❄️ 冷卻期 - 等待後重新入場 (已註解 - 停損功能停用)
-    /* COOLDOWN 處理註解開始
+    // ❄️ 冷卻期 - 等待最後5秒重新入場
     if (state.tradingState === TradingState.COOLDOWN) {
-        const now = Date.now();
-        
-        // 冷卻尚未結束
-        if (now < state.cooldownUntil) {
+        // 等待到最後 N 秒才能重新入場
+        if (timeRemaining > CONFIG.REBUY_WAIT_UNTIL_SECONDS) {
             displayStatus(prices, timeRemaining);
             return;
         }
         
-        // 檢查是否已達到本輪停損上限
-        if (state.stopLossCount >= CONFIG.MAX_STOP_LOSS_PER_ROUND) {
-            console.log(`\n🚫 已達本輪停損上限 (${state.stopLossCount}次)，本輪不再入場`);
+        // 檢查是否已達到本輪重買上限
+        if (state.rebuyCount >= CONFIG.MAX_REBUY_PER_ROUND) {
+            console.log(`\n🚫 已達本輪重買上限 (${state.rebuyCount}次)，本輪不再入場`);
             state.tradingState = TradingState.SKIPPED;
             displayStatus(prices, timeRemaining);
             return;
         }
         
-        // 冷卻結束，檢查是否可以重新入場
+        // 到達最後5秒，檢查是否可以重新入場
         const higherPrice = Math.max(prices.up, prices.down);
         const higherSide: "UP" | "DOWN" = prices.up >= prices.down ? "UP" : "DOWN";
         
-        // 鎖定期不允許重新入場
-        if (timeRemaining < CONFIG.LOCK_TIME) {
-            state.tradingState = TradingState.LOCKED;
-            console.log("\n❄️ 冷卻結束但已進入鎖定期，本輪不再入場");
-            displayStatus(prices, timeRemaining);
-            return;
-        }
-        
-        // 檢查是否達到重新入場條件
+        // 檢查是否達到重新入場條件 (勝率 >= 85%)
         if (higherPrice >= CONFIG.MIN_REBUY_PROB) {
-            console.log(`\n♻️ 冷卻結束，重新入場: ${higherSide} @ ${(higherPrice * 100).toFixed(2)}%`);
+            state.rebuyCount++;
+            console.log(`\n♻️ 最後${CONFIG.REBUY_WAIT_UNTIL_SECONDS}秒重新入場: ${higherSide} @ ${(higherPrice * 100).toFixed(2)}% (重買第${state.rebuyCount}次)`);
             
-            const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining, prices);
+            const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining);
             state.currentRoundOrder = order;
             state.currentPosition = {
                 side: higherSide,
@@ -930,7 +794,6 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
         displayStatus(prices, timeRemaining);
         return;
     }
-    COOLDOWN 處理註解結束 */
     
     // 已下單（但還沒設定持倉），轉換到持倉狀態
     if (state.tradingState === TradingState.ORDERED && state.currentRoundOrder && !state.currentPosition) {
@@ -941,80 +804,104 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             amount: order.amount,
         };
         state.tradingState = TradingState.HOLDING;
-        console.log(`\n📊 開始持倉監控 (停損已停用)`);
+        console.log(`\n📊 開始持倉監控`);
         displayStatus(prices, timeRemaining);
         return;
     }
     
-    // 鎖定期 (< 5s)
-    if (timeRemaining < CONFIG.LOCK_TIME) {
-        if (state.tradingState !== TradingState.LOCKED) {
-            state.tradingState = TradingState.LOCKED;
-            console.log("\n🔒 進入鎖定期，禁止下單");
-        }
-        displayStatus(prices, timeRemaining);
-        return;
-    }
-    
-    // 最後決策期 (12s ~ 4s)
-    if (timeRemaining <= CONFIG.MONITORING_END && timeRemaining >= CONFIG.LOCK_TIME) {
+    // 最後決策期 (15s ~ 0s) - 取消鎖定期限制
+    if (timeRemaining <= CONFIG.MONITORING_END && timeRemaining >= 0) {
         if (state.tradingState !== TradingState.FINAL_DECISION) {
             state.tradingState = TradingState.FINAL_DECISION;
             console.log("\n⚡ 進入最後決策期");
         }
         
-        // T-6s 或更早時執行最後決策（只執行一次）
-        if (!state.finalDecisionMade && timeRemaining <= CONFIG.FINAL_DECISION_TIME) {
-            state.finalDecisionMade = true;
+        // 延遲進場判斷 (T-10s)
+        if (state.delayedEntry && !state.delayedEntryMade && timeRemaining <= 10) {
+            state.delayedEntryMade = true;
             const higherSide: "UP" | "DOWN" = prices.up >= prices.down ? "UP" : "DOWN";
             const higherPrice = Math.max(prices.up, prices.down);
             
-            // ⚠️ 檢查是否適合入場
-            const entryCheck = shouldEnterTrade(higherPrice, higherSide);
-            
-            if (!entryCheck.ok) {
-                console.log(`\n⚠️ T-${timeRemaining}s 跳過入場: ${entryCheck.reason}`);
-                state.tradingState = TradingState.SKIPPED;
-                displayStatus(prices, timeRemaining);
-                return;
+            console.log(`\n🕒 T-${timeRemaining}s 延遲進場判斷: 當前較高為 ${higherSide} (${(higherPrice * 100).toFixed(1)}%)`);
+            if (higherPrice >= CONFIG.HIGH_PROB_THRESHOLD) {
+                const order = simulateOrder(higherSide, higherPrice, "STANDARD", timeRemaining);
+                state.currentRoundOrder = order;
+                state.currentPosition = {
+                    side: higherSide,
+                    entryPrice: higherPrice,
+                    amount: order.amount,
+                };
+                state.tradingState = TradingState.HOLDING;
+                state.finalDecisionMade = true; // 已經進場，略過後面的 finalDecision
+                console.log(`📊 開始持倉監控`);
+            } else {
+                console.log(`   勝率不足 ${CONFIG.HIGH_PROB_THRESHOLD * 100}%，放棄延遲進場`);
             }
+        }
+        
+        // 最後決策 (T-8s 到 T-0s 期間)
+        if (!state.finalDecisionMade && timeRemaining <= CONFIG.FINAL_DECISION_TIME) {
+            const higherSide: "UP" | "DOWN" = prices.up >= prices.down ? "UP" : "DOWN";
+            const higherPrice = Math.max(prices.up, prices.down);
             
-            console.log(`\n⚡ T-${timeRemaining}s 最後決策: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
-            
-            const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining, prices);
-            state.currentRoundOrder = order;
-            state.currentPosition = {
-                side: higherSide,
-                entryPrice: higherPrice,
-                amount: order.amount,
-            };
-            state.tradingState = TradingState.HOLDING;
-            console.log(`📊 開始持倉監控 (停損已停用)`);
+            // 策略邏輯：
+            // 1. 若勝率 >= 80%，提早觸發
+            // 2. 若撐到最後 2 秒 (timeRemaining <= 2)，強制無條件選兩邊最高的
+            if (higherPrice >= 0.80 || timeRemaining <= 2) {
+                state.finalDecisionMade = true;
+                
+                if (higherPrice >= 0.80) {
+                    console.log(`\n⚡ T-${timeRemaining}s 達到 80% 保底門檻，最後決策: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
+                } else {
+                    console.log(`\n⚡ T-${timeRemaining}s 等待極限，強制選擇勝率最高方: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
+                }
+                
+                const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining);
+                state.currentRoundOrder = order;
+                state.currentPosition = {
+                    side: higherSide,
+                    entryPrice: higherPrice,
+                    amount: order.amount,
+                };
+                state.tradingState = TradingState.HOLDING;
+                console.log(`📊 開始持倉監控`);
+            }
         }
         
         displayStatus(prices, timeRemaining);
         return;
     }
     
-    // 監控期 (40s ~ 12s)
+    // 監控期 (60s ~ 15s)
     if (timeRemaining <= CONFIG.MONITORING_START && timeRemaining > CONFIG.MONITORING_END) {
         if (state.tradingState !== TradingState.MONITORING) {
             state.tradingState = TradingState.MONITORING;
             state.consecutiveHighProb = { up: 0, down: 0 };
-            console.log("\n👀 進入監控期");
+            
+            if (prices.up >= 0.90 || prices.down >= 0.90) {
+                state.delayedEntry = true;
+                const higherSide = prices.up >= prices.down ? "UP" : "DOWN";
+                const higherPrice = Math.max(prices.up, prices.down);
+                console.log(`\n👀 進入監控期，初始勝率過高 (${higherSide}: ${(higherPrice * 100).toFixed(1)}%)，延遲至最後10秒判斷`);
+            } else {
+                state.delayedEntry = false;
+                console.log("\n👀 進入監控期");
+            }
         }
         
-        // 檢查高勝率（需要在範圍內：86% ~ 94%）
-        const upCheck = shouldEnterTrade(prices.up, "UP");
-        const downCheck = shouldEnterTrade(prices.down, "DOWN");
+        if (state.delayedEntry) {
+            displayStatus(prices, timeRemaining);
+            return;
+        }
         
-        if (upCheck.ok) {
+        // 檢查高勝率
+        if (prices.up >= CONFIG.HIGH_PROB_THRESHOLD) {
             state.consecutiveHighProb.up++;
             state.consecutiveHighProb.down = 0;
             
             if (state.consecutiveHighProb.up >= CONFIG.CONSECUTIVE_HITS) {
-                console.log(`\n🎯 UP 連續 ${state.consecutiveHighProb.up} 次達標！(${(prices.up * 100).toFixed(1)}%)`);
-                const order = simulateOrder("UP", prices.up, "STANDARD", timeRemaining, prices);
+                console.log(`\n🎯 UP 連續 ${state.consecutiveHighProb.up} 次達標！`);
+                const order = simulateOrder("UP", prices.up, "STANDARD", timeRemaining);
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: "UP",
@@ -1022,15 +909,15 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
                     amount: order.amount,
                 };
                 state.tradingState = TradingState.HOLDING;
-                console.log(`📊 開始持倉監控 (停損已停用)`);
+                console.log(`📊 開始持倉監控`);
             }
-        } else if (downCheck.ok) {
+        } else if (prices.down >= CONFIG.HIGH_PROB_THRESHOLD) {
             state.consecutiveHighProb.down++;
             state.consecutiveHighProb.up = 0;
             
             if (state.consecutiveHighProb.down >= CONFIG.CONSECUTIVE_HITS) {
-                console.log(`\n🎯 DOWN 連續 ${state.consecutiveHighProb.down} 次達標！(${(prices.down * 100).toFixed(1)}%)`);
-                const order = simulateOrder("DOWN", prices.down, "STANDARD", timeRemaining, prices);
+                console.log(`\n🎯 DOWN 連續 ${state.consecutiveHighProb.down} 次達標！`);
+                const order = simulateOrder("DOWN", prices.down, "STANDARD", timeRemaining);
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: "DOWN",
@@ -1038,10 +925,9 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
                     amount: order.amount,
                 };
                 state.tradingState = TradingState.HOLDING;
-                console.log(`📊 開始持倉監控 (停損已停用)`);
+                console.log(`📊 開始持倉監控`);
             }
         } else {
-            // 重置連續計數（價格不在有效範圍內）
             state.consecutiveHighProb = { up: 0, down: 0 };
         }
         
@@ -1087,15 +973,16 @@ function exportReport(): string {
         report += `| ${trade.round} | ${trade.marketSlug.slice(-10)} | ${trade.side} | ${trade.orderType} | ${(trade.entryPrice * 100).toFixed(1)}% | $${trade.amount.toFixed(2)} | ${trade.result} | $${trade.profit.toFixed(2)} | $${trade.balanceAfter.toFixed(2)} |\n`;
     }
     
-    report += `\n## ⚙️ 策略參數 (優化版 v2)\n\n`;
-    report += `- 入場範圍: ${CONFIG.HIGH_PROB_THRESHOLD * 100}% ~ ${CONFIG.MAX_PROB_THRESHOLD * 100}%\n`;
+    report += `\n## ⚙️ 策略參數\n\n`;
+    report += `- 高勝率門檻: ${CONFIG.HIGH_PROB_THRESHOLD * 100}%\n`;
     report += `- 連續達標次數: ${CONFIG.CONSECUTIVE_HITS}\n`;
-    report += `- 標準倉位乘數: ${CONFIG.STANDARD_MULTIPLIER} (本金/5 * ${CONFIG.STANDARD_MULTIPLIER})\n`;
-    report += `- 防禦倉位乘數: ${CONFIG.DEFENSIVE_MULTIPLIER} (本金/5 * ${CONFIG.DEFENSIVE_MULTIPLIER})\n`;
-    report += `- 對沖停用價格: >${CONFIG.HEDGE_DISABLE_ABOVE * 100}%\n`;
-    report += `- 價格穩定性檢查: ${CONFIG.PRICE_STABILITY_CHECK ? "啟用" : "停用"}\n`;
-    report += `- 最大波動容忍: ${CONFIG.MAX_PRICE_VOLATILITY * 100}%\n`;
-    report += `- 停損閾值: ${CONFIG.STOP_LOSS_THRESHOLD * 100}% (已停用)\n`;
+    report += `- 標準倉位: 本金/${5 / CONFIG.STANDARD_MULTIPLIER}\n`;
+    report += `- 防禦倉位: 本金/${5 / CONFIG.DEFENSIVE_MULTIPLIER}\n`;
+    report += `- 停損閾值: ${CONFIG.STOP_LOSS_THRESHOLD * 100}%\n`;
+    report += `- 最後N秒不停損: ${CONFIG.STOP_LOSS_HOLD_SECONDS} 秒\n`;
+    report += `- 停損後等待重買: 最後 ${CONFIG.REBUY_WAIT_UNTIL_SECONDS} 秒\n`;
+    report += `- 每輪重買上限: ${CONFIG.MAX_REBUY_PER_ROUND} 次\n`;
+    report += `- 重新入場最低勝率: ${CONFIG.MIN_REBUY_PROB * 100}%\n`;
     
     return report;
 }
@@ -1121,17 +1008,15 @@ function getTimeRemaining(market: any): number {
 // ============================================
 async function runSimulator() {
     console.log("\n" + "=".repeat(60));
-    console.log("🎮 BTC 5分鐘預測市場模擬交易系統 (優化版 v2)");
+    console.log("🎮 BTC 5分鐘預測市場模擬交易系統");
     console.log("=".repeat(60));
     console.log(`\n📋 策略配置:`);
     console.log(`   初始本金: $${CONFIG.INITIAL_BALANCE}`);
-    console.log(`   入場範圍: ${CONFIG.HIGH_PROB_THRESHOLD * 100}% ~ ${CONFIG.MAX_PROB_THRESHOLD * 100}%`);
+    console.log(`   高勝率門檻: ${CONFIG.HIGH_PROB_THRESHOLD * 100}%`);
     console.log(`   連續達標: ${CONFIG.CONSECUTIVE_HITS} 次`);
     console.log(`   標準倉位: $${(CONFIG.INITIAL_BALANCE / 5 * CONFIG.STANDARD_MULTIPLIER).toFixed(2)}`);
     console.log(`   防禦倉位: $${(CONFIG.INITIAL_BALANCE / 5 * CONFIG.DEFENSIVE_MULTIPLIER).toFixed(2)}`);
-    console.log(`   對沖停用價格: >${CONFIG.HEDGE_DISABLE_ABOVE * 100}%`);
-    console.log(`   價格穩定性檢查: ${CONFIG.PRICE_STABILITY_CHECK ? "啟用" : "停用"}`);
-    console.log(`\n🚨 停損機制: ⚠️ 已停用`);
+    console.log(`\n🚨 停損機制: ✅ 已啟用 (閾值: ${CONFIG.STOP_LOSS_THRESHOLD * 100}%)`);
     console.log("\n按 Ctrl+C 停止\n");
     
     state.isRunning = true;
@@ -1174,10 +1059,12 @@ async function runSimulator() {
                 state.currentRoundOrder = null;
                 state.consecutiveHighProb = { up: 0, down: 0 };
                 state.finalDecisionMade = false;
+                state.delayedEntry = false;
+                state.delayedEntryMade = false;
                 state.currentPosition = null;
-                state.cooldownUntil = 0;
-                state.stopLossCount = 0;
-                state.priceHistory = []; // 清空價格歷史
+                state.stopLossTriggered = false;
+                state.rebuyCount = 0;
+                state.stopLossConfirmCount = 0;
                 
                 console.log(`\n\n${"=".repeat(50)}`);
                 console.log(`📌 第 ${state.totalRounds} 輪 - 新市場`);
@@ -1266,6 +1153,8 @@ async function main() {
         console.log(`\n📊 交易統計:`);
         console.log(`   總輪數: ${state.totalRounds}`);
         console.log(`   勝: ${state.wins} | 負: ${state.losses} | 跳過: ${state.skipped}`);
+        console.log(`   停損次數: ${state.stopLossCount} | 停損總額: -$${state.stopLossTotalAmount.toFixed(2)}`);
+        console.log(`   總獲勝金額: +$${state.totalWinAmount.toFixed(2)} | 平均獲勝: +$${state.wins > 0 ? (state.totalWinAmount / state.wins).toFixed(2) : '0.00'}`);
         console.log(`   勝率: ${state.wins + state.losses > 0 ? ((state.wins / (state.wins + state.losses)) * 100).toFixed(1) : 0}%`);
         console.log(`   最終餘額: $${state.balance.toFixed(2)}`);
         console.log(`   總損益: $${(state.balance - CONFIG.INITIAL_BALANCE).toFixed(2)}`);
