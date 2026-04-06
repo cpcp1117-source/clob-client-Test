@@ -42,14 +42,10 @@ const CONFIG = {
     // 資金管理
     // (注意: 實際初始本金會自動抓取當前錢包真實餘額，見程式碼第 270 行)
     INITIAL_BALANCE: 0,                        // 初始本金會被自動覆寫為真實錢包餘額
-    // (注意: 測試期間已將開單金額固定為 $1 USDC，下方乘數目前不作用，見程式碼第 706 行)
-    STANDARD_MULTIPLIER: 1.0,                  
-    DEFENSIVE_MULTIPLIER: 0.5,                 
     
     // 策略參數
     HIGH_PROB_THRESHOLD: 0.85,                 // 85% 高勝率門檻
     CONSECUTIVE_HITS: 5,                       // 連續達標次數
-    MAX_LATENCY: 500,                          // 最大延遲 ms
     
     // 停損機制
     STOP_LOSS_THRESHOLD: 0.15,                 // 價格下跌 15% 觸發停損
@@ -63,10 +59,9 @@ const CONFIG = {
     MONITORING_START: 30,                      // 監控期開始 (剩餘30秒)
     MONITORING_END: 15,                        // 監控期結束 (剩餘15秒)
     FINAL_DECISION_TIME: 5,                    // 最後決策時間點 (剩餘5秒)
-    LOCK_TIME: 2,                              // 鎖定期 (剩餘2秒以下)
     
     // 結算與領獎
-    REDEEM_DELAY: 240000,                      // 市場結束後等待多久才領獎 (4分鐘)
+    REDEEM_DELAY: 180000,                      // 市場結束後等待多久才領獎 (3分鐘)
     REDEEM_CHECK_INTERVAL: 30000,              // 檢查可領獎間隔 (30秒)
     
     // API 設定
@@ -82,7 +77,6 @@ const CONFIG = {
     WS_PING_INTERVAL: 15000,
     
     // Gas 設定 (Polygon)
-    GAS_PRICE: 100_000_000_000,                // 100 Gwei
     GAS_LIMIT_APPROVE: 200_000,
     GAS_LIMIT_REDEEM: 300_000,
 };
@@ -111,7 +105,6 @@ interface LiveOrder {
     price: number;
     amount: number;
     shares: number;                            // 購買的股數
-    potentialReturn: number;
     orderType: "STANDARD" | "DEFENSIVE";
     timestamp: Date;
     timeRemaining: number;
@@ -122,11 +115,10 @@ interface LiveOrder {
 interface PendingRedeem {
     conditionId: string;
     marketSlug: string;
-    side: "UP" | "DOWN";
     shares: number;
-    entryPrice: number;
     marketEndTime: Date;
     redeemAttempts: number;
+    lastAttemptTime?: number; // 🆕 追蹤最後嘗試時間以進行退避 (Backoff)
 }
 
 interface TradingSystemState {
@@ -158,6 +150,7 @@ interface TradingSystemState {
     
     // 待領獎列表
     pendingRedeems: PendingRedeem[];
+    relayerCooldownUntil: number; // 🆕 處理 429 錯誤的冷卻期
     
     // 統計
     totalRounds: number;
@@ -166,7 +159,6 @@ interface TradingSystemState {
     skipped: number;
     stopLossCount: number;
     stopLossTotalAmount: number;
-    totalWinAmount: number;
     totalRedeemed: number;
 }
 
@@ -203,6 +195,7 @@ const state: TradingSystemState = {
     stopLossConfirmCount: 0,
     
     pendingRedeems: [],
+    relayerCooldownUntil: 0,
     
     totalRounds: 0,
     wins: 0,
@@ -210,7 +203,6 @@ const state: TradingSystemState = {
     skipped: 0,
     stopLossCount: 0,
     stopLossTotalAmount: 0,
-    totalWinAmount: 0,
     totalRedeemed: 0,
 };
 
@@ -229,7 +221,6 @@ let globalOnPriceCallback: ((prices: { up: number; down: number }) => void) | nu
 
 console.log("✅ 正式交易系統模組載入完成");
 console.log(`   網路: ${CONFIG.IS_MAINNET ? "Polygon 主網" : "Amoy 測試網"}`);
-console.log(`   初始本金: $${CONFIG.INITIAL_BALANCE}`);
 
 // ============================================
 // 🔐 初始化交易客戶端
@@ -258,15 +249,14 @@ async function initializeTradingClient(): Promise<boolean> {
         // 判斷簽章類型：有 FUNDER_ADDRESS 表示使用 Polymarket 代理錢包
         const funderAddress = process.env.FUNDER_ADDRESS;
         const sigType = funderAddress ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
-        console.log(`   簽章類型: ${funderAddress ? "POLY_GNOSIS_SAFE (代理錢包)" : "EOA (直接錢包)"}`);
+        
         if (funderAddress) {
-            console.log(`   代理錢包: ${funderAddress}`);
+            // console.log(`   代理錢包: ${funderAddress}`);
         }
         
         // 取得或建立 API 憑證
         const tempClient = new ClobClient(CONFIG.CLOB_API_URL, CONFIG.CHAIN_ID, wallet);
         const creds = await tempClient.createOrDeriveApiKey();
-        console.log(`   API Key: ${creds.key.slice(0, 10)}...`);
         
         // 初始化完整客戶端 (使用正確的簽章類型)
         clobClient = new ClobClient(
@@ -280,7 +270,7 @@ async function initializeTradingClient(): Promise<boolean> {
         
         // 取得 Polymarket 平台（含代理錢包）的餘額
         let balanceFormatted = 0;
-        const balanceResponse: any = await clobClient.getBalanceAllowance({ asset_type: "COLLATERAL" as any });
+        const balanceResponse: any = await clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
         if (balanceResponse && typeof balanceResponse.balance !== "undefined") {
             balanceFormatted = parseFloat(balanceResponse.balance) / 1e6;
         } else {
@@ -518,28 +508,15 @@ async function executeRealOrder(
     }
     
     try {
-        // 計算股數 (shares = amount / price)
-        const shares = Math.floor((amount / price) * 100) / 100;
+        console.log(`\n🚀 執行真實下單 [${orderType}]`);
+        console.log(`   方向: ${side} (${outcomeLabels[side.toLowerCase() as "up" | "down"]})`);
+        console.log(`   價格: ${(price * 100).toFixed(2)}% | 金額: $${amount.toFixed(2)}`);
         
         // 獲取市場參數
         const tickSize = market.minimum_tick_size || "0.01";
         const negRisk = market.neg_risk || false;
         
-        console.log(`\n${"=".repeat(50)}`);
-        console.log(`🚀 執行真實下單 [${orderType}]`);
-        console.log(`   方向: ${side} (${outcomeLabels[side.toLowerCase() as "up" | "down"]})`);
-        console.log(`   Token ID: ${tokenId.slice(0, 20)}...`);
-        console.log(`   價格: ${(price * 100).toFixed(2)}%`);
-        console.log(`   金額: $${amount.toFixed(2)}`);
-        console.log(`   股數: ${shares.toFixed(2)}`);
-        console.log(`   剩餘時間: ${timeRemaining}s`);
-        
-        // 計算「市價 (含滑點)」下單。Polymarket 中 10% 以上滑點基本等同於市價單
-        // 因為 FAK 會自動為您匹配訂單簿上最優的價格直到撮合完成
         const cappedPrice = Math.min(0.99, price + slippage);
-        
-        console.log(`   模式: 市價買入 (Market Buy)`);
-        console.log(`   滑點價格限制: ${(cappedPrice * 100).toFixed(2)}% (+${(slippage * 100).toFixed(2)}%)`);
         
         const response = await clobClient.createAndPostMarketOrder(
             {
@@ -556,18 +533,26 @@ async function executeRealOrder(
         if (response.success === false || response.error) {
             const errorMsg = response.errorMsg || response.error;
             console.error(`   ❌ 下單失敗: ${errorMsg}`);
-            
-            // 特殊錯誤提示
-            if (JSON.stringify(response).includes("fully filled")) {
-                console.warn(`   💡 提示: 訂單簿深度不足或價格波動過快，已自動取消剩餘部分`);
-            }
             return null;
         }
         
-        console.log(`   訂單回應:`, JSON.stringify(response).slice(0, 200));
-        
         const orderId = response.orderID || response.id || `ORD-${Date.now()}`;
-        console.log(`   ✅ 下單成功! 訂單 ID: ${orderId}`);
+        console.log(`   ✅ 下單成功! 訂單 ID: ${orderId.slice(0,15)}...`);
+        
+        // 🛠️ 優化：從 API 回應獲取「實時成交股數」而非本地計算
+        let actualShares = 0;
+        if (response.takingAmount) {
+            const takingNum = parseFloat(response.takingAmount);
+            if (!isNaN(takingNum) && takingNum > 0) {
+                actualShares = takingNum;
+            }
+        }
+        
+        if (actualShares === 0) {
+            actualShares = Math.floor((amount / price) * 100) / 100;
+        }
+
+        console.log(`   📊 成交股數: ${actualShares.toFixed(2)}`);
         console.log(`${"=".repeat(50)}\n`);
         
         // 更新餘額
@@ -582,8 +567,7 @@ async function executeRealOrder(
             side,
             price,
             amount,
-            shares,
-            potentialReturn: shares,  // 勝利時獲得的股數
+            shares: actualShares,
             orderType,
             timestamp: new Date(),
             timeRemaining,
@@ -604,49 +588,123 @@ async function executeRealOrder(
 async function executeSellOrder(tokenId: string, shares: number): Promise<boolean> {
     if (!clobClient) return false;
     
+    // 🔍 獲取該市場的精確 tickSize (通常 0.01)
+    let tickSize = "0.01";
     try {
-        console.log(`\n🔻 執行停損賣出: ${shares} 股`);
-        
-        const response = await clobClient.createAndPostMarketOrder(
-            {
-                tokenID: tokenId,
-                amount: shares,
-                side: Side.SELL,
-                orderType: OrderType.FAK,
-            },
-            { tickSize: "0.01" },
-            OrderType.FAK
-        );
-        
-        if (response.success === false || response.error) {
-            console.error(`   ❌ 賣出失敗: ${response.errorMsg || response.error}`);
-            return false;
+        const info = await clobClient.getTickSize(tokenId);
+        if (info) tickSize = info.toString();
+    } catch {}
+
+    const maxRetries = 3;
+    let attempt = 0;
+    
+    while (attempt < maxRetries) {
+        attempt++;
+        try {
+            if (attempt > 1) {
+                console.log(`   ⏳ 正在重試賣出 (${attempt}/${maxRetries})...`);
+                await sleep(500); // 每次重試等待 500ms
+            } else {
+                console.log(`\n🔻 執行停損賣出: ${shares.toFixed(6)} 股`);
+            }
+            
+            // 🚀 修正：賣出前獲取真實代幣餘額，防止因手續費導致的「餘額不足」錯誤
+            let finalShares = shares;
+            if (clobClient) {
+                try {
+                    const balanceRes: any = await clobClient.getBalanceAllowance({
+                        asset_type: AssetType.CONDITIONAL,
+                        token_id: tokenId
+                    });
+                    if (balanceRes && typeof balanceRes.balance !== "undefined") {
+                        let realBalance = parseFloat(balanceRes.balance) / 1e6;
+                        
+                        // 🆕 處理同步延遲：如果原本有倉位但查詢為 0，進行重試
+                        if (realBalance === 0 && shares > 0 && attempt < maxRetries) {
+                            console.warn(`   ⚠️ 餘額顯示為 0，但在本地記錄中有持倉，正在等待同步...`);
+                            await sleep(1000); // 等待 1 秒
+                            // 再次獲取
+                            const secondTry: any = await clobClient.getBalanceAllowance({
+                                asset_type: AssetType.CONDITIONAL,
+                                token_id: tokenId
+                            });
+                            if (secondTry && typeof secondTry.balance !== "undefined") {
+                                realBalance = parseFloat(secondTry.balance) / 1e6;
+                            }
+                        }
+
+                        if (realBalance < shares) {
+                            console.log(`   📝 餘額修正: 預計 ${shares.toFixed(6)} -> 實際 ${realBalance.toFixed(6)} (補償手續費)`);
+                            finalShares = realBalance;
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`   ⚠️ 無法獲取實時餘額，將嘗試以原始股數賣出`);
+                }
+            }
+
+            if (finalShares <= 0) {
+                console.log(`   ℹ️ 檢測到餘額為 0，視為已賣出或未成交`);
+                return true; 
+            }
+
+            // Polymarket FAK 訂單在此模式下等同於 Market Sell
+            const response = await clobClient!.createAndPostMarketOrder(
+                {
+                    tokenID: tokenId,
+                    amount: finalShares,
+                    side: Side.SELL,
+                    orderType: OrderType.FAK,
+                    price: 0.01, // 極低限價 = 市價單
+                },
+                { tickSize: tickSize as any }
+            );
+            
+            if (response.success === false || response.error) {
+                const errorMsg = response.errorMsg || response.error || "";
+                
+                // 如果是餘額不足，且還有重試機會，執行重試
+                if ((errorMsg.includes("balance") || errorMsg.includes("allowance")) && attempt < maxRetries) {
+                    console.warn(`   ⚠️ 餘額尚未同步 (balance: 0)，結算延遲中...`);
+                    continue;
+                }
+                
+                console.error(`   ❌ 賣出失敗: ${errorMsg}`);
+                return false;
+            }
+            
+            console.log(`   ✅ 停損賣出成功 (訂單 ID: ${(response.orderID || response.id).slice(0, 10)}...)`);
+            
+            // 📊 統計：停損視為一場虧損
+            state.losses++;
+            state.stopLossCount++;
+            if (state.currentPosition) {
+                const estLoss = (state.currentPosition.entryPrice - 0.01) * shares; 
+                state.stopLossTotalAmount += Math.max(0, estLoss);
+            }
+            
+            return true;
+            
+        } catch (error: any) {
+            console.error(`   ❌ 停損賣出錯誤 (嘗試 ${attempt}):`, error.message || error);
+            if (attempt >= maxRetries) return false;
         }
-        
-        console.log(`   ✅ 停損賣出成功`);
-        return true;
-        
-    } catch (error) {
-        console.error(`❌ 停損賣出錯誤:`, error);
-        return false;
     }
+    
+    return false;
 }
 
 // ============================================
 // 🎁 領取獎勵 (Redeem) - 支援 Safe 代理錢包
 // ============================================
 
-async function redeemPositions(conditionId: string, marketSlug: string = "unknown"): Promise<boolean> {
+async function redeemPositions(conditionId: string, marketSlug: string = "unknown", attempt: number = 1): Promise<boolean> {
     const contractConfig = getContractConfig(CONFIG.CHAIN_ID);
-    
-    console.log(`\n🎁 領取獎勵...`);
-    console.log(`   Condition ID: ${conditionId.slice(0, 20)}...`);
 
     // --------------------------------------------
     // 優先模式: Relayer (Gasless / Safe 錢包首選)
     // --------------------------------------------
     if (relayClient) {
-        console.log(`   模式: Relayer SDK (Safe Gasless)...`);
         try {
             // CTF redeemPositions ABI (正規 viem 格式)
             const ctfRedeemAbi = [
@@ -682,24 +740,43 @@ async function redeemPositions(conditionId: string, marketSlug: string = "unknow
             };
             
             console.log(`   ⏳ 發送 Relayer 交易...`);
-            const response = await relayClient.execute([redeemTx], `redeem ${conditionId.slice(0, 10)}`);
-            console.log(`   📤 Relayer 交易已提交! ID: ${response.transactionID}`);
+            const response = await withTimeout(
+                relayClient.execute([redeemTx], `redeem ${conditionId.slice(0, 10)}`),
+                20000, // 20 秒提交超時
+                "Relayer 提交響應過慢"
+            );
             
-            console.log(`   ⏳ 等待交易確認...`);
-            const result = await response.wait();
+            const result = await withTimeout(
+                response.wait(),
+                30000, 
+                "鏈上確認超時"
+            );
             
             if (result && result.transactionHash) {
-                console.log(`   ✅ 領取成功! Hash: ${result.transactionHash}`);
+                console.log(`   ✅ 領取成功 (Hash: ${result.transactionHash.slice(0, 8)}...)`);
                 state.totalRedeemed++;
                 return true;
             }
         } catch (error: any) {
             const errMsg = error.message || JSON.stringify(error);
+            const status = error.response?.status || error.status;
+
+            // 🆕 429 Too Many Requests 處理
+            if (status === 429 || errMsg.includes("429") || errMsg.includes("quota exceeded")) {
+                console.warn(`\n⚠️ Relayer 配額耗盡 (429)，暫停領獎任務 5 分鐘...`);
+                state.relayerCooldownUntil = Date.now() + (5 * 60 * 1000);
+                return false;
+            }
+
             if (errMsg.includes("revert") || errMsg.includes("insufficient") || errMsg.includes("execution reverted")) {
-                console.log(`   ℹ️ 無可領取餘額 (可能已領取或該方輸了)`);
+                console.log(`   ℹ️ 無可領取餘額 (已領取或該方未獲勝)`);
                 return true;
             }
-            console.error(`   ❌ Relayer 領取失敗:`, errMsg);
+            if (errMsg.includes("TIMEOUT")) {
+                // console.warn(`   ⚠️ 領取超時 (可能仍在處理中)，將在稍後自動重試`);
+            } else {
+                console.error(`   ❌ 領取失敗: ${errMsg.slice(0, 50)}...`);
+            }
         }
     }
     
@@ -708,7 +785,6 @@ async function redeemPositions(conditionId: string, marketSlug: string = "unknow
     // --------------------------------------------
     if (ctfContract && wallet) {
         try {
-            console.log(`   模式: EOA 直接呼叫`);
             const redeemNonce = await wallet.getTransactionCount("pending");
             const tx = await ctfContract.redeemPositions(
                 contractConfig.collateral,
@@ -723,24 +799,21 @@ async function redeemPositions(conditionId: string, marketSlug: string = "unknow
                 }
             );
             
-            console.log(`   交易送出: ${tx.hash}`);
             const receipt = await tx.wait();
             if (receipt.status === 1) {
-                console.log(`   ✅ 領取成功! (EOA 直接模式)`);
+                console.log(`   ✅ 領取成功 (EOA)`);
                 state.totalRedeemed++;
                 return true;
             }
         } catch (error: any) {
             const errMsg = error.message || "";
             if (errMsg.includes("revert") || errMsg.includes("insufficient")) {
-                console.log(`   ℹ️ 無可領取餘額 (可能已領取或輸了)`);
+                console.log(`   ℹ️ 無可領取餘額`);
                 return true;
             }
-            console.error(`   ❌ 直接領取錯誤:`, errMsg);
         }
     }
 
-    console.error("   ❌ 無法領取: 請至 Polymarket 網頁手動處理");
     return false;
 }
 
@@ -751,28 +824,45 @@ async function processPendingRedeems(): Promise<void> {
     if (state.pendingRedeems.length === 0) return;
     
     const now = Date.now();
+    
+    // 🛑 檢查冷卻期 (429)
+    if (now < state.relayerCooldownUntil) {
+        return;
+    }
+
     const toRemove: number[] = [];
     
+    // 🛡️ 修正：按照用戶要求，最大重試次數改為 3 次
+    const MAX_ATTEMPTS = 3;
+
     for (let i = 0; i < state.pendingRedeems.length; i++) {
         const item = state.pendingRedeems[i];
         
-        // 檢查是否已過等待時間
-        const waitTime = now - item.marketEndTime.getTime();
-        if (waitTime < CONFIG.REDEEM_DELAY) {
+        // 🆕 持久化退避邏輯 (Exponential Backoff Idea)
+        // 第一次待 4 分鐘，第二次失敗後待 5 分鐘，第三次帶 10 分鐘，以此類推
+        // 第 N 次間隔 = REDEEM_DELAY + (attempts * 5 分鐘)
+        const backoffMs = item.redeemAttempts * (5 * 60 * 1000); 
+        const nextAllowedTime = (item.lastAttemptTime || item.marketEndTime.getTime()) + (item.redeemAttempts === 0 ? CONFIG.REDEEM_DELAY : backoffMs);
+        
+        if (now < nextAllowedTime) {
             continue;
         }
         
-        console.log(`\n📊 處理待領獎: ${item.marketSlug}`);
+        console.log(`\n🎁 [${item.marketSlug}] 正在領取 (第 ${item.redeemAttempts + 1} 次)...`);
         
-        const success = await redeemPositions(item.conditionId);
+        item.lastAttemptTime = now;
+        const success = await redeemPositions(item.conditionId, item.marketSlug, item.redeemAttempts + 1);
         
         if (success) {
             toRemove.push(i);
         } else {
             item.redeemAttempts++;
-            if (item.redeemAttempts >= 5) {
-                console.log(`   ⚠️ 已嘗試 5 次，放棄領獎`);
+            if (item.redeemAttempts >= MAX_ATTEMPTS) {
+                console.log(`   ⚠️ [${item.marketSlug}] 已嘗試 ${MAX_ATTEMPTS} 次仍失敗，放棄任務`);
                 toRemove.push(i);
+            } else {
+                const nextWaitMins = Math.floor((item.redeemAttempts * 5 * 60 * 1000) / 60000);
+                console.log(`   ⚠️ 領取暫時失敗，將在 ${nextWaitMins || 2} 分鐘後重試`);
             }
         }
     }
@@ -785,6 +875,51 @@ async function processPendingRedeems(): Promise<void> {
     // 如果有處理任何項目（不論輸贏），都重新同步一次餘額
     if (toRemove.length > 0) {
         await syncBalance();
+    }
+}
+
+// ============================================
+// 🔍 掃描並加入歷史未領取獎勵
+// ============================================
+async function scanAndAddOldRedeems(): Promise<void> {
+    if (!clobClient) return;
+    
+    // 取得錢包地址 (優先使用代理錢包)
+    const funderAddress = process.env.FUNDER_ADDRESS;
+    const userAddress = funderAddress || await wallet?.getAddress();
+    
+    if (!userAddress) return;
+    
+    console.log(`\n🔍 啟動自動掃描: 正在檢查錢包中的歷史未領取獎勵...`);
+    try {
+        const DATA_API_URL = "https://data-api.polymarket.com";
+        const resp = await fetch(`${DATA_API_URL}/positions?user=${userAddress}`);
+        const positions: any[] = await resp.json();
+        
+        // 過濾出已結算且獲勝的持倉 (curPrice === 1)
+        const rewards = positions.filter(p => p.size > 0 && p.curPrice === 1);
+        
+        if (rewards.length === 0) {
+            console.log(`   ℹ️ 未發現任何歷史未領取獎勵。`);
+            return;
+        }
+        
+        console.log(`   ✨ 發現 ${rewards.length} 筆歷史未領取獎勵！已加入待領排程。`);
+        for (const r of rewards) {
+            // 檢查是否已經在排程中，避免重複加入
+            const exists = state.pendingRedeems.some(p => p.conditionId === r.conditionId);
+            if (!exists) {
+                state.pendingRedeems.push({
+                    conditionId: r.conditionId,
+                    marketSlug: r.asset || "Historical Market",
+                    shares: parseFloat(r.size),
+                    marketEndTime: new Date(), // 設定為已結束
+                    redeemAttempts: 0,
+                });
+            }
+        }
+    } catch (error) {
+        console.error("   ❌ 自動掃描失敗:", error);
     }
 }
 
@@ -897,6 +1032,17 @@ function connectPriceWebSocket(
         if (pingInterval) clearInterval(pingInterval);
         
         if (state.isRunning && subscribedTokenIds && globalOnPriceCallback) {
+            // 🆕 避讓機制：如果現在距離市場結束不到 5 秒 (關鍵決策期)，則暫不執行網路重連
+            // 避免重連開銷影響下單執行
+            const currentMarket = state.currentMarket;
+            if (currentMarket) {
+                const tr = getTimeRemaining(currentMarket);
+                if (tr <= 5 && tr > 0) {
+                    // console.log("   🚫 關鍵決策期禁用重連以優化下單延遲");
+                    return;
+                }
+            }
+            
             setTimeout(() => {
                 if (state.isRunning) connectPriceWebSocket(subscribedTokenIds!, globalOnPriceCallback!, true);
             }, CONFIG.WS_RECONNECT_DELAY);
@@ -1022,12 +1168,6 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
         const currentPrice = side === "UP" ? prices.up : prices.down;
         const dropPercent = (entryPrice - currentPrice) / entryPrice;
         
-        if (timeRemaining <= CONFIG.STOP_LOSS_HOLD_SECONDS) {
-            state.stopLossConfirmCount = 0;
-            displayStatus(prices, timeRemaining);
-            return;
-        }
-        
         if (dropPercent >= CONFIG.STOP_LOSS_THRESHOLD) {
             state.stopLossConfirmCount++;
             if (state.stopLossConfirmCount >= CONFIG.STOP_LOSS_CONFIRM_COUNT) {
@@ -1052,6 +1192,12 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
                     state.currentRoundOrder = null;
                     state.stopLossTriggered = true;
                     state.stopLossConfirmCount = 0;
+                    
+                    // 🛡️ 依照用戶要求：不論賣出成功與否，都進入冷卻期以評估是否需要購買反向倉位
+                    if (!soldSuccess) {
+                        console.warn(`\n⚠️ 停損賣出未完全成功，但仍繼續監控反向機會...`);
+                    }
+                    
                     state.tradingState = state.rebuyCount >= CONFIG.MAX_REBUY_PER_ROUND 
                         ? TradingState.SKIPPED : TradingState.COOLDOWN;
                 } finally {
@@ -1099,6 +1245,7 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
                         tokenId,
                     };
                     state.tradingState = TradingState.HOLDING;
+                    state.finalDecisionMade = true; // 🆕 標記決策已完成，防止最後幾秒重複下單
                 }
             } finally {
                 orderLock = false;
@@ -1116,6 +1263,12 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
             console.log("\n⚡ 進入最後決策期");
         }
         
+        // 🆕 修正：如果已經有持倉（不論是剛下的還是追單下的），就不進度最後決策下單
+        if (state.currentPosition) {
+            displayStatus(prices, timeRemaining);
+            return;
+        }
+
         if (!state.finalDecisionMade && timeRemaining <= CONFIG.FINAL_DECISION_TIME && cachedTokenIds && state.currentMarket) {
             // 🔒 上鎖 + 先切換狀態，防止並行下單
             orderLock = true;
@@ -1165,6 +1318,11 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
     
     // 監控期
     if (timeRemaining <= CONFIG.MONITORING_START && timeRemaining > CONFIG.MONITORING_END) {
+        if (state.currentPosition) {
+            displayStatus(prices, timeRemaining);
+            return;
+        }
+        
         // 如果已經下過單（成功或失敗），不要重設狀態
         if (state.tradingState === TradingState.ORDERED || state.tradingState === TradingState.HOLDING) {
             displayStatus(prices, timeRemaining);
@@ -1182,8 +1340,8 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
             state.consecutiveHighProb.down = 0;
             
             if (state.consecutiveHighProb.up >= CONFIG.CONSECUTIVE_HITS && cachedTokenIds && state.currentMarket) {
-                // ⛔ 價格過高 (≥97%) 時跳過下單 — 訂單簿流動性不足會導致 no match
-                if (prices.up >= 0.97) {
+                // ⛔ 價格過高 (≥99%) 時跳過下單 — 訂單簿流動性不足會導致 no match
+                if (prices.up >= 0.99) {
                     console.log(`\n⚠️ UP ${(prices.up * 100).toFixed(0)}% 過高，跳過下單 (訂單簿無流動性)`);
                     state.monitoringSkipped = true;
                     state.tradingState = TradingState.HOLDING; // 防止重試
@@ -1222,8 +1380,8 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
             state.consecutiveHighProb.up = 0;
             
             if (state.consecutiveHighProb.down >= CONFIG.CONSECUTIVE_HITS && cachedTokenIds && state.currentMarket) {
-                // ⛔ 價格過高 (≥97%) 時跳過下單 — 訂單簿流動性不足會導致 no match
-                if (prices.down >= 0.97) {
+                // ⛔ 價格過高 (≥99%) 時跳過下單 — 訂單簿流動性不足會導致 no match
+                if (prices.down >= 0.99) {
                     console.log(`\n⚠️ DOWN ${(prices.down * 100).toFixed(0)}% 過高，跳過下單 (訂單簿無流動性)`);
                     state.monitoringSkipped = true;
                     state.tradingState = TradingState.HOLDING; // 防止重試
@@ -1280,6 +1438,23 @@ function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ⏳ 超時保護包裝器
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+    let timeoutId: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+            reject(new Error(`TIMEOUT: ${errorMessage}`));
+        }, timeoutMs);
+    });
+
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    } finally {
+        // @ts-ignore
+        clearTimeout(timeoutId);
+    }
+}
+
 function getTimeRemaining(market: any): number {
     const endTime = market.endDate || market.end_date_iso;
     if (!endTime) return 999;
@@ -1325,20 +1500,30 @@ async function runLiveTrading() {
                 if (state.currentRoundOrder && state.tradingState === TradingState.HOLDING) {
                     state.currentRoundOrder.finalPrices = { ...state.lastPrices };
                     
+                    // 📊 判定勝負 (基於最後捕捉到的價格)
+                    const upP = state.lastPrices.up;
+                    const downP = state.lastPrices.down;
+                    const side = state.currentRoundOrder.side;
+                    
+                    const isWin = (side === "UP" && upP > downP) || (side === "DOWN" && downP > upP);
+                    if (isWin) {
+                        state.wins++;
+                    } else {
+                        state.losses++;
+                    }
+                    
                     // 加入待領獎列表
                     if (state.currentRoundOrder.conditionId) {
                         state.pendingRedeems.push({
                             conditionId: state.currentRoundOrder.conditionId,
                             marketSlug: state.currentRoundOrder.marketSlug,
-                            side: state.currentRoundOrder.side,
                             shares: state.currentRoundOrder.shares,
-                            entryPrice: state.currentRoundOrder.price,
-                            marketEndTime: new Date(),
+                            marketEndTime: new Date(), // 現在即結束
                             redeemAttempts: 0,
                         });
                         console.log(`\n📝 訂單加入待領獎列表 (共 ${state.pendingRedeems.length} 筆)`);
                     }
-                } else if (state.totalRounds > 0) {
+                } else if (state.totalRounds > 1) { // 第一輪(剛啟動)若沒下單不計入跳過
                     state.skipped++;
                     console.log(`\n⏭️ 第 ${state.totalRounds} 輪跳過（無下單）`);
                 }
@@ -1436,6 +1621,7 @@ async function main() {
         console.log(`   勝: ${state.wins} | 負: ${state.losses} | 跳過: ${state.skipped}`);
         console.log(`   停損: ${state.stopLossCount} 次 (-$${state.stopLossTotalAmount.toFixed(2)})`);
         console.log(`   已領獎: ${state.totalRedeemed} 筆`);
+        console.log(`   初始本金: $${CONFIG.INITIAL_BALANCE.toFixed(2)}`);
         console.log(`   最終餘額: $${state.balance.toFixed(2)}`);
         console.log(`   報酬率: ${(((state.balance - CONFIG.INITIAL_BALANCE) / CONFIG.INITIAL_BALANCE) * 100).toFixed(2)}%`);
         console.log(`${"=".repeat(50)}`);
@@ -1456,10 +1642,8 @@ async function main() {
         process.exit(1);
     }
     
-    // 確認執行
-    console.log("\n⚠️  即將開始正式交易！");
-    console.log("   按 Ctrl+C 取消，或等待 5 秒後自動開始...\n");
-    await sleep(5000);
+    // 🔍 啟動自動掃描歷史獎勵
+    await scanAndAddOldRedeems();
     
     await runLiveTrading();
 }

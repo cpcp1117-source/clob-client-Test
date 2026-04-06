@@ -125,6 +125,8 @@ async function testRedeem() {
         try {
             const resp = await fetch(`${DATA_API_URL}/positions?user=${userAddress}`);
             const positions: any[] = await resp.json();
+            
+            // 過濾出已結算且獲勝的持倉 (curPrice === 1 表示已結算為 $1)
             const rewards = positions.filter(p => p.size > 0 && p.curPrice === 1);
             
             if (rewards.length === 0) {
@@ -135,24 +137,49 @@ async function testRedeem() {
             console.log(`\n✨ 發現 ${rewards.length} 筆可領取獎勵:`);
             console.log("-".repeat(50));
             rewards.forEach((r, idx) => {
-                console.log(`${idx + 1}. [${r.title}]`);
+                console.log(`${idx + 1}. [${r.title || r.asset}]`);
                 console.log(`   Condition ID: ${r.conditionId}`);
+                console.log(`   持有量: ${r.size} 股`);
                 console.log("-".repeat(50));
             });
             
-            console.log(`\n🚀 準備自動為您領取第 1 筆獎勵...`);
-            conditionId = rewards[0].conditionId;
+            console.log(`\n🚀 準備開始「批量」領取共 ${rewards.length} 筆獎勵...`);
+            
+            let successCount = 0;
+            for (let i = 0; i < rewards.length; i++) {
+                const r = rewards[i];
+                console.log(`\n🎯 [${i + 1}/${rewards.length}] 執行領獎: ${r.title || r.asset}`);
+                
+                const success = await performRedeem(r.conditionId, relayClient, CHAIN_ID);
+                if (success) successCount++;
+                
+                if (i < rewards.length - 1) {
+                    console.log(`   ⏳ 等待 3 秒後處理下一筆...`);
+                    await new Promise(res => setTimeout(res, 3000));
+                }
+            }
+            
+            console.log(`\n${"=".repeat(50)}`);
+            console.log(`🏁 批量任務完成! 成功: ${successCount} | 失敗: ${rewards.length - successCount}`);
+            console.log(`${"=".repeat(50)}`);
+            return;
+            
         } catch (err) {
             console.error(`   ❌ 掃描失敗:`, err);
             return;
         }
+    } else {
+        // 手動指定 Condition ID 模式
+        console.log(`\n🎯 執行手動指定領獎:`);
+        await performRedeem(conditionId, relayClient, CHAIN_ID);
     }
-    
-    // 5. 執行領獎
-    console.log(`\n🎯 執行領獎:`);
-    console.log(`   Condition ID: ${conditionId}`);
-    
-    const contractConfig = getContractConfig(CHAIN_ID);
+}
+
+/**
+ * 封裝單次領獎邏輯
+ */
+async function performRedeem(conditionId: string, relayClient: RelayClient, chainId: number): Promise<boolean> {
+    const contractConfig = getContractConfig(chainId);
     const calldata = encodeFunctionData({
         abi: ctfRedeemAbi,
         functionName: "redeemPositions",
@@ -170,24 +197,30 @@ async function testRedeem() {
         value: "0"
     };
     
-    console.log(`\n📤 發送 Relayer 交易...`);
     try {
+        console.log(`   📤 發送 Relayer 交易...`);
         const response = await relayClient.execute([redeemTx], `redeem ${conditionId.slice(0, 10)}`);
-        console.log(`   ✅ 交易已提交! ID: ${response.transactionID}`);
+        // console.log(`   ✅ 交易已提交! ID: ${response.transactionID}`);
         
-        console.log(`   ⏳ 等待區塊鏈確認...`);
+        console.log(`   ⏳ 等待鏈上確認...`);
         const result = await response.wait();
         
         if (result && result.transactionHash) {
-            console.log(`\n${"=".repeat(50)}`);
-            console.log(`✅ 領取成功!`);
-            console.log(`   交易 Hash: ${result.transactionHash}`);
-            console.log(`${"=".repeat(50)}`);
+            console.log(`   ✅ 領取成功! Hash: ${result.transactionHash.slice(0, 10)}...`);
+            return true;
         }
     } catch (error: any) {
-        console.error(`\n❌ 領取失敗:`);
-        console.error(`   API 回傳: ${JSON.stringify(error.response?.data || error.message)}`);
+        console.error(`   ❌ 領取異常:`);
+        const errorData = error.response?.data || error.message;
+        const errorStr = typeof errorData === "object" ? JSON.stringify(errorData) : errorData;
+        
+        if (errorStr.includes("revert") || errorStr.includes("insufficient") || errorStr.includes("already redeemed")) {
+            console.warn(`   ℹ️ 提示: 可能已領取過，或該持倉目前無法領取。`);
+        } else {
+            console.error(`   原因: ${errorStr.slice(0, 200)}`);
+        }
     }
+    return false;
 }
 
 testRedeem().catch(console.error);
