@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
-import { ClobClient, Chain } from "./src/index.ts";
+import { ClobClient, Chain } from "../clob-client-Hong/src/index.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, ".env") });
 

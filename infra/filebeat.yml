@@ -4,7 +4,8 @@ filebeat.inputs:
 - type: log
   enabled: true
   paths:
-    - 'c:\Users\cpcp3\Desktop\PolyTest - 複製\clob-client-Hong\logs\*.json.log'
+    # ⚠️ 請根據實際路徑修改
+    - 'd:\coreator\clob-client-Test\logs\*.json.log'
   json.keys_under_root: true
   json.overwrite_keys: true
 

@@ -1,0 +1,37 @@
+# =============================================
+# clob-client-Test 專案 .gitignore
+# =============================================
+
+# 日誌輸出目錄
+logs/
+
+# 環境變數
+.env
+.env.local
+.env.*.local
+
+# Node.js
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build 產物
+dist/
+build/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 測試覆蓋率
+coverage/
+.nyc_output/

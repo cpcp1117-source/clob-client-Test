@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
-import { ClobClient, Chain, Side, OrderType, SignatureType, type ApiKeyCreds } from "../src/index.ts";
+import { ClobClient, Chain, Side, OrderType, SignatureType, type ApiKeyCreds } from "../../../clob-client-Hong/src/index.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
 

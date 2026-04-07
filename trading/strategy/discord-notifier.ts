@@ -1,6 +1,6 @@
 import { spawnSync } from 'child_process';
 import * as path from 'path';
-import { logger } from '../src/logger';
+import { logger } from '../../clob-client-Hong/src/logger';
 
 /**
  * 📢 Discord 通知工具

@@ -24,11 +24,11 @@ import {
     SignatureType,
     type ApiKeyCreds,
     Chain 
-} from "../src/index.ts";
-import { getContractConfig } from "../src/config.ts";
-import { ctfAbi } from "../examples/abi/ctfAbi.ts";
-import { usdcAbi } from "../examples/abi/usdcAbi.ts";
-import { logger } from "../src/logger.ts";
+} from "../../clob-client-Hong/src/index.ts";
+import { getContractConfig } from "../../clob-client-Hong/src/config.ts";
+import { ctfAbi } from "../../clob-client-Hong/examples/abi/ctfAbi.ts";
+import { usdcAbi } from "../../clob-client-Hong/examples/abi/usdcAbi.ts";
+import { logger } from "../../clob-client-Hong/src/logger.ts";
 import { sendDiscordNotification } from "./discord-notifier.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });

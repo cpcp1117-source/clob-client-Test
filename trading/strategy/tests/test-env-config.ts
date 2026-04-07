@@ -22,10 +22,10 @@ import {
     OrderType, 
     AssetType,
     Chain 
-} from "../src/index.ts";
-import { getContractConfig } from "../src/config.ts";
-import { ctfAbi } from "../examples/abi/ctfAbi.ts";
-import { usdcAbi } from "../examples/abi/usdcAbi.ts";
+} from "../../../clob-client-Hong/src/index.ts";
+import { getContractConfig } from "../../../clob-client-Hong/src/config.ts";
+import { ctfAbi } from "../../../clob-client-Hong/examples/abi/ctfAbi.ts";
+import { usdcAbi } from "../../../clob-client-Hong/examples/abi/usdcAbi.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
 
