@@ -10,9 +10,9 @@
 import { WebSocket } from "ws";
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
-import { ClobClient, Chain, Side } from "../clob-client-Hong/src/index.ts";
+import { ClobClient, Chain, Side } from "@polymarket/clob-client";
 
-dotenvConfig({ path: resolve(import.meta.dirname, ".env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
 
 const TEST_DURATION = 10000; // 測試 10 秒
 

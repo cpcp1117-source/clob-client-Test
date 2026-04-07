@@ -24,14 +24,14 @@ import {
     SignatureType,
     type ApiKeyCreds,
     Chain 
-} from "../../clob-client-Hong/src/index.ts";
-import { getContractConfig } from "../../clob-client-Hong/src/config.ts";
-import { ctfAbi } from "../../clob-client-Hong/examples/abi/ctfAbi.ts";
-import { usdcAbi } from "../../clob-client-Hong/examples/abi/usdcAbi.ts";
-import { logger } from "../../clob-client-Hong/src/logger.ts";
+} from "@polymarket/clob-client";
+import { getContractConfig } from "../lib/config.ts";
+import { ctfAbi } from "../lib/abi/ctfAbi.ts";
+import { usdcAbi } from "../lib/abi/usdcAbi.ts";
+import { logger } from "../lib/logger.ts";
 import { sendDiscordNotification } from "./discord-notifier.ts";
 
-dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
 
 // ============================================
 // 🎛️ 策略配置

@@ -1,0 +1,36 @@
+{
+  "name": "clob-client-test",
+  "version": "1.0.0",
+  "description": "基於 [@polymarket/clob-client](https://github.com/Polymarket/clob-client) 的自動交易系統。",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cpcp1117-source/clob-client-Test.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/cpcp1117-source/clob-client-Test/issues"
+  },
+  "homepage": "https://github.com/cpcp1117-source/clob-client-Test#readme",
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
+    "dotenv": "^17.4.1",
+    "ethers": "^6.16.0",
+    "viem": "^2.47.10",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}

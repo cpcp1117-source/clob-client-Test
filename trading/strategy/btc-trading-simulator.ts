@@ -10,7 +10,7 @@ import { resolve } from "path";
 import { WebSocket } from "ws";
 import * as fs from "fs";
 
-dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
 
 // ============================================
 // 🎛️ 策略配置

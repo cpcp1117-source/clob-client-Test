@@ -1,9 +1,9 @@
 import { ethers } from "ethers";
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
-import { ClobClient, Chain, Side, OrderType, SignatureType, type ApiKeyCreds } from "../../../clob-client-Hong/src/index.ts";
+import { ClobClient, Chain, Side, OrderType, SignatureType, type ApiKeyCreds } from "@polymarket/clob-client";
 
-dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../../.env") });
 
 // --- 測試目標設定 ---
 // 目標市場: Will the Iranian regime fall by April 30?

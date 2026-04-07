@@ -1,9 +1,9 @@
 // 使用 CLOB API 搜索 5分鐘市場
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
-import { ClobClient, Chain } from "../../clob-client-Hong/src/index.ts";
+import { ClobClient, Chain } from "@polymarket/clob-client";
 
-dotenvConfig({ path: resolve(import.meta.dirname, ".env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
 
 async function searchCLOBMarkets() {
     console.log("🔍 使用 CLOB API 搜索市場...\n");

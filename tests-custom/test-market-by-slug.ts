@@ -1,7 +1,7 @@
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
 
-dotenvConfig({ path: resolve(import.meta.dirname, ".env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
 
 async function getMarketBySlug() {
     console.log("🔍 查詢特定市場...\n");

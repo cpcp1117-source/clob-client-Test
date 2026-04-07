@@ -14,9 +14,9 @@ import { ethers } from "ethers";
 import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
 import { WebSocket } from "ws";
-import { ClobClient, Chain, Side, OrderType, type ApiKeyCreds } from "../../clob-client-Hong/src/index.ts";
+import { ClobClient, Chain, Side, OrderType, type ApiKeyCreds } from "@polymarket/clob-client";
 
-dotenvConfig({ path: resolve(import.meta.dirname, ".env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
 
 // ============================================
 // 🎛️ 交易配置

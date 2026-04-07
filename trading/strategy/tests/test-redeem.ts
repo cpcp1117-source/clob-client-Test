@@ -13,10 +13,10 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import { RelayClient, RelayerTxType } from "@polymarket/builder-relayer-client";
 import { BuilderConfig } from "@polymarket/builder-signing-sdk";
-import { ClobClient } from "../../../clob-client-Hong/src/index.ts";
-import { getContractConfig } from "../../../clob-client-Hong/src/config.ts";
+import { ClobClient } from "@polymarket/clob-client";
+import { getContractConfig } from "../../lib/config.ts";
 
-dotenvConfig({ path: resolve(import.meta.dirname, "../.env") });
+dotenvConfig({ path: resolve(import.meta.dirname, "../../../.env") });
 
 const RELAYER_URL = "https://relayer-v2.polymarket.com";
 const DATA_API_URL = "https://data-api.polymarket.com";

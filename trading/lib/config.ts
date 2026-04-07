@@ -1,4 +1,4 @@
-type ContractConfig = {
+export type ContractConfig = {
     exchange: string;
     negRiskAdapter: string;
     negRiskExchange: string;
@@ -22,10 +22,10 @@ const MATIC_CONTRACTS: ContractConfig = {
     conditionalTokens: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
 };
 
-const COLLATERAL_TOKEN_DECIMALS = 6;
-const CONDITIONAL_TOKEN_DECIMALS = 6;
+export const COLLATERAL_TOKEN_DECIMALS = 6;
+export const CONDITIONAL_TOKEN_DECIMALS = 6;
 
-const getContractConfig = (chainID: number): ContractConfig => {
+export const getContractConfig = (chainID: number): ContractConfig => {
     switch (chainID) {
         case 137:
             return MATIC_CONTRACTS;
@@ -35,6 +35,3 @@ const getContractConfig = (chainID: number): ContractConfig => {
             throw new Error("Invalid network");
     }
 };
-
-export type { ContractConfig };
-export { getContractConfig, COLLATERAL_TOKEN_DECIMALS, CONDITIONAL_TOKEN_DECIMALS };
