@@ -4,6 +4,7 @@
 
 # 日誌輸出目錄
 logs/
+reports/
 
 # 環境變數
 .env
