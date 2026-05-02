@@ -4,7 +4,11 @@
 
 # 日誌輸出目錄
 logs/
+<<<<<<< HEAD
 .agent/codex-requests/
+=======
+reports/
+>>>>>>> 816f280d7cabbeb8d090c78b7d99262d4051ad9d
 
 # 環境變數
 .env

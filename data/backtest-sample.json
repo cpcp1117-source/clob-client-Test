@@ -1,0 +1,72 @@
+{
+  "snapshots": [
+    {
+      "marketId": "btc-5m-1",
+      "timestamp": "2026-01-01T00:00:00.000Z",
+      "secondsToClose": 60,
+      "upPrice": 0.82,
+      "downPrice": 0.18
+    },
+    {
+      "marketId": "btc-5m-1",
+      "timestamp": "2026-01-01T00:00:01.000Z",
+      "secondsToClose": 59,
+      "upPrice": 0.86,
+      "downPrice": 0.14
+    },
+    {
+      "marketId": "btc-5m-1",
+      "timestamp": "2026-01-01T00:00:02.000Z",
+      "secondsToClose": 58,
+      "upPrice": 0.87,
+      "downPrice": 0.13
+    },
+    {
+      "marketId": "btc-5m-1",
+      "timestamp": "2026-01-01T00:00:03.000Z",
+      "secondsToClose": 57,
+      "upPrice": 0.88,
+      "downPrice": 0.12
+    },
+    {
+      "marketId": "btc-5m-1",
+      "timestamp": "2026-01-01T00:04:59.000Z",
+      "secondsToClose": 1,
+      "upPrice": 0.99,
+      "downPrice": 0.01
+    },
+    {
+      "marketId": "btc-5m-2",
+      "timestamp": "2026-01-01T00:05:00.000Z",
+      "secondsToClose": 60,
+      "upPrice": 0.12,
+      "downPrice": 0.88
+    },
+    {
+      "marketId": "btc-5m-2",
+      "timestamp": "2026-01-01T00:05:01.000Z",
+      "secondsToClose": 59,
+      "upPrice": 0.13,
+      "downPrice": 0.87
+    },
+    {
+      "marketId": "btc-5m-2",
+      "timestamp": "2026-01-01T00:05:02.000Z",
+      "secondsToClose": 58,
+      "upPrice": 0.14,
+      "downPrice": 0.86
+    },
+    {
+      "marketId": "btc-5m-2",
+      "timestamp": "2026-01-01T00:05:20.000Z",
+      "secondsToClose": 40,
+      "upPrice": 0.30,
+      "downPrice": 0.70
+    }
+  ],
+  "settlements": {
+    "btc-5m-1": "UP",
+    "btc-5m-2": "UP"
+  }
+}
+

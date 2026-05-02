@@ -4,11 +4,24 @@
   "description": "基於 [@polymarket/clob-client](https://github.com/Polymarket/clob-client) 的自動交易系統。",
   "main": "index.js",
   "scripts": {
+<<<<<<< HEAD
     "simulate:btc": "tsx trading/strategy/btc-trading-simulator.ts",
     "trade:btc": "tsx trading/strategy/btc-trading-live.ts",
     "orchestra:codex": "powershell -ExecutionPolicy Bypass -File .agent/skills/codex-system/scripts/ask_codex.ps1",
     "check:types": "tsc --noEmit --pretty false --ignoreConfig --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions trading/strategy/btc-trading-simulator.ts",
     "test": "npm run check:types"
+=======
+    "test": "node --import tsx --test tests-custom/automation.test.ts",
+    "typecheck": "tsc --noEmit",
+    "backtest": "tsx trading/automation/backtest.ts",
+    "fetch:btc5m": "tsx trading/automation/fetch-btc-5m-history.ts",
+    "simulate:btc5m": "tsx trading/automation/simulate-live-btc5m.ts",
+    "simulate:btc5m:split": "tsx trading/automation/simulate-live-btc5m-split.ts",
+    "simulate:btc5m:strategy": "tsx trading/strategy/btc-trading-simulator.ts",
+    "discord:test": "tsx trading/strategy/discord-notifier.ts",
+    "optimize": "tsx trading/automation/optimizer.ts",
+    "automation:check": "npm test && npm run typecheck && npm run backtest"
+>>>>>>> 816f280d7cabbeb8d090c78b7d99262d4051ad9d
   },
   "repository": {
     "type": "git",
