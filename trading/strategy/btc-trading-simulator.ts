@@ -9,29 +9,45 @@ import { config as dotenvConfig } from "dotenv";
 import { resolve } from "path";
 import { WebSocket } from "ws";
 import * as fs from "fs";
+import { externalSignalEnabled, externalSignalFailOpen, getBtcEdgeSignal } from "./btc-edge-signal.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
+
+function envNumber(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+}
 
 // ============================================
 // 🎛️ 策略配置
 // ============================================
 const CONFIG = {
     // 資金管理
-    INITIAL_BALANCE: 50,           // 初始本金 $50
-    STANDARD_MULTIPLIER: 1.0,      // 標準倉位 = 本金/5 * 1.0
-    DEFENSIVE_MULTIPLIER: 0.5,     // 防禦倉位 = 本金/5 * 0.5 
+    INITIAL_BALANCE: envNumber("SIM_INITIAL_BALANCE", 50),
+    STANDARD_RATIO: envNumber("STANDARD_RATIO", 0.05),
+    DEFENSIVE_RATIO: envNumber("DEFENSIVE_RATIO", 0.03),
+    MAX_BET_AMOUNT: envNumber("MAX_BET_AMOUNT", 5),
+    MIN_CASH_RESERVE: envNumber("MIN_CASH_RESERVE", 2),
+    MAX_SESSION_LOSS_RATIO: envNumber("MAX_SESSION_LOSS_RATIO", 0.15),
     
     // 策略參數
-    HIGH_PROB_THRESHOLD: 0.85,     // 85% 高勝率門檻
-    CONSECUTIVE_HITS: 5,           // 連續達標次數
+    HIGH_PROB_THRESHOLD: envNumber("HIGH_PROB_THRESHOLD", 0.88),
+    FINAL_PROB_THRESHOLD: envNumber("FINAL_PROB_THRESHOLD", 0.90),
+    REBUY_PROB_THRESHOLD: envNumber("REBUY_PROB_THRESHOLD", 0.90),
+    CONSECUTIVE_HITS: envNumber("CONSECUTIVE_HITS", 6),
+    MAX_ENTRY_PRICE: envNumber("MAX_ENTRY_PRICE", 0.96),
+    MIN_NET_RETURN_RATIO: envNumber("MIN_NET_RETURN_RATIO", 0.04),
+    MIN_MODEL_EDGE: envNumber("MIN_MODEL_EDGE", 0.03),
     MAX_LATENCY: 500,              // 最大延遲 ms
     
     // 停損機制
-    STOP_LOSS_THRESHOLD: 0.13,     // 價格下跌 13% 觸發停損 (放寬以容忍波動)
-    STOP_LOSS_CONFIRM_COUNT: 3,    // 需連續 N 次低於閾值才觸發停損
+    STOP_LOSS_THRESHOLD: envNumber("STOP_LOSS_THRESHOLD", 0.10),
+    STOP_LOSS_CONFIRM_COUNT: envNumber("STOP_LOSS_CONFIRM_COUNT", 4),
     STOP_LOSS_HOLD_SECONDS: 5,     // 最後 N 秒不執行停損（只保護最後5秒）
     REBUY_WAIT_UNTIL_SECONDS: 5,   // 停損後等到最後 N 秒才能重新下單
-    MIN_REBUY_PROB: 0.85,          // 重新買入最低勝率 85%
+    MIN_REBUY_PROB: envNumber("MIN_REBUY_PROB", envNumber("REBUY_PROB_THRESHOLD", 0.90)),
     STABLE_PRICE_TOLERANCE: 0.02,  // 價格穩定容忍度
     MAX_REBUY_PER_ROUND: 1,        // 每輪最多重新下單次數
     
@@ -421,11 +437,81 @@ function extractTokenIds(market: any): { up: string; down: string } | null {
 // 💰 計算下注金額
 // ============================================
 function calculateBetAmount(orderType: "STANDARD" | "DEFENSIVE"): number {
-    const unit = state.balance / 5;
-    const multiplier = orderType === "STANDARD" 
-        ? CONFIG.STANDARD_MULTIPLIER 
-        : CONFIG.DEFENSIVE_MULTIPLIER;
-    return Math.round(unit * multiplier * 100) / 100;
+    const ratio = orderType === "STANDARD" ? CONFIG.STANDARD_RATIO : CONFIG.DEFENSIVE_RATIO;
+    const tradableBalance = Math.max(0, state.balance - CONFIG.MIN_CASH_RESERVE);
+    const amount = Math.min(tradableBalance * ratio, CONFIG.MAX_BET_AMOUNT);
+    if (amount < 1) return 0;
+    return Math.round(amount * 100) / 100;
+}
+
+function sessionLossExceeded(): boolean {
+    if (CONFIG.INITIAL_BALANCE <= 0) return false;
+    const minBalance = CONFIG.INITIAL_BALANCE * (1 - CONFIG.MAX_SESSION_LOSS_RATIO);
+    return state.balance <= minBalance;
+}
+
+function hasEnoughNetReturn(price: number): boolean {
+    if (price <= 0) return false;
+    const netReturnRatio = (1 / price) - 1;
+    return netReturnRatio >= CONFIG.MIN_NET_RETURN_RATIO;
+}
+
+function shouldEnterTrade(
+    side: "UP" | "DOWN",
+    price: number,
+    amount: number,
+    minProbability: number,
+    reason: string
+): boolean {
+    if (sessionLossExceeded()) {
+        console.log(`\n🛑 跳過 ${reason}: 本次執行虧損已達 ${(CONFIG.MAX_SESSION_LOSS_RATIO * 100).toFixed(1)}% 風控線`);
+        return false;
+    }
+    if (amount < 1) {
+        console.log(`\n🛑 跳過 ${reason}: 可用下單金額不足 $1，保留現金 $${CONFIG.MIN_CASH_RESERVE.toFixed(2)}`);
+        return false;
+    }
+    if (price < minProbability) {
+        console.log(`\n⏭️ 跳過 ${reason}: ${side} ${(price * 100).toFixed(2)}% 未達 ${(minProbability * 100).toFixed(2)}%`);
+        return false;
+    }
+    if (price > CONFIG.MAX_ENTRY_PRICE) {
+        console.log(`\n⏭️ 跳過 ${reason}: 入場價 ${(price * 100).toFixed(2)}% 高於上限 ${(CONFIG.MAX_ENTRY_PRICE * 100).toFixed(2)}%`);
+        return false;
+    }
+    if (!hasEnoughNetReturn(price)) {
+        console.log(`\n⏭️ 跳過 ${reason}: 潛在淨報酬低於 ${(CONFIG.MIN_NET_RETURN_RATIO * 100).toFixed(2)}%`);
+        return false;
+    }
+    return true;
+}
+
+async function passesExternalSignal(
+    side: "UP" | "DOWN",
+    prices: { up: number; down: number },
+    timeRemaining: number,
+    reason: string
+): Promise<boolean> {
+    if (!externalSignalEnabled()) return true;
+
+    const signal = await getBtcEdgeSignal(prices, timeRemaining);
+    if (!signal) {
+        const action = externalSignalFailOpen() ? "允許" : "阻擋";
+        console.log(`\n⚠️ 外部 BTC 訊號不可用，${action} ${reason}`);
+        return externalSignalFailOpen();
+    }
+
+    console.log(`\n📡 ${signal.reason}`);
+
+    if (signal.side !== side) {
+        console.log(`   ⏭️ 跳過 ${reason}: 外部模型偏向 ${signal.side}，不是 ${side}`);
+        return false;
+    }
+    if (signal.edge < CONFIG.MIN_MODEL_EDGE) {
+        console.log(`   ⏭️ 跳過 ${reason}: 模型 edge ${(signal.edge * 100).toFixed(2)}% 低於 ${(CONFIG.MIN_MODEL_EDGE * 100).toFixed(2)}%`);
+        return false;
+    }
+    return true;
 }
 
 // ============================================
@@ -662,7 +748,7 @@ function displayStatus(prices: { up: number; down: number }, timeRemaining: numb
 // ============================================
 // 🎮 策略核心邏輯
 // ============================================
-function processStrategy(prices: { up: number; down: number }, timeRemaining: number) {
+async function processStrategy(prices: { up: number; down: number }, timeRemaining: number) {
     state.lastPrices = prices;
     
     // 跳過或結算中，不處理
@@ -769,6 +855,16 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             console.log(`\n♻️ 最後${CONFIG.REBUY_WAIT_UNTIL_SECONDS}秒重新入場: ${higherSide} @ ${(higherPrice * 100).toFixed(2)}% (重買第${state.rebuyCount}次)`);
             
             const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining);
+            if (!shouldEnterTrade(higherSide, higherPrice, order.amount, CONFIG.MIN_REBUY_PROB, "rebuy")) {
+                state.tradingState = TradingState.SKIPPED;
+                displayStatus(prices, timeRemaining);
+                return;
+            }
+            if (!(await passesExternalSignal(higherSide, prices, timeRemaining, "rebuy"))) {
+                state.tradingState = TradingState.SKIPPED;
+                displayStatus(prices, timeRemaining);
+                return;
+            }
             state.currentRoundOrder = order;
             state.currentPosition = {
                 side: higherSide,
@@ -825,6 +921,16 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             console.log(`\n🕒 T-${timeRemaining}s 延遲進場判斷: 當前較高為 ${higherSide} (${(higherPrice * 100).toFixed(1)}%)`);
             if (higherPrice >= CONFIG.HIGH_PROB_THRESHOLD) {
                 const order = simulateOrder(higherSide, higherPrice, "STANDARD", timeRemaining);
+                if (!shouldEnterTrade(higherSide, higherPrice, order.amount, CONFIG.HIGH_PROB_THRESHOLD, "delayed entry")) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal(higherSide, prices, timeRemaining, "delayed entry"))) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: higherSide,
@@ -844,19 +950,27 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             const higherSide: "UP" | "DOWN" = prices.up >= prices.down ? "UP" : "DOWN";
             const higherPrice = Math.max(prices.up, prices.down);
             
-            // 策略邏輯：
-            // 1. 若勝率 >= 80%，提早觸發
-            // 2. 若撐到最後 2 秒 (timeRemaining <= 2)，強制無條件選兩邊最高的
-            if (higherPrice >= 0.80 || timeRemaining <= 2) {
+            // 策略邏輯：只在達到最後決策門檻時進場；最後2秒也會再跑風控，不再無條件追價。
+            if (higherPrice >= CONFIG.FINAL_PROB_THRESHOLD || timeRemaining <= 2) {
                 state.finalDecisionMade = true;
                 
-                if (higherPrice >= 0.80) {
-                    console.log(`\n⚡ T-${timeRemaining}s 達到 80% 保底門檻，最後決策: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
+                if (higherPrice >= CONFIG.FINAL_PROB_THRESHOLD) {
+                    console.log(`\n⚡ T-${timeRemaining}s 達到最後決策門檻，最後決策: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
                 } else {
-                    console.log(`\n⚡ T-${timeRemaining}s 等待極限，強制選擇勝率最高方: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
+                    console.log(`\n⚡ T-${timeRemaining}s 等待極限，檢查最高方是否通過風控: ${higherSide} (${(higherPrice * 100).toFixed(2)}%)`);
                 }
                 
                 const order = simulateOrder(higherSide, higherPrice, "DEFENSIVE", timeRemaining);
+                if (!shouldEnterTrade(higherSide, higherPrice, order.amount, CONFIG.FINAL_PROB_THRESHOLD, "final decision")) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal(higherSide, prices, timeRemaining, "final decision"))) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: higherSide,
@@ -902,6 +1016,16 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             if (state.consecutiveHighProb.up >= CONFIG.CONSECUTIVE_HITS) {
                 console.log(`\n🎯 UP 連續 ${state.consecutiveHighProb.up} 次達標！`);
                 const order = simulateOrder("UP", prices.up, "STANDARD", timeRemaining);
+                if (!shouldEnterTrade("UP", prices.up, order.amount, CONFIG.HIGH_PROB_THRESHOLD, "standard entry")) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal("UP", prices, timeRemaining, "standard entry"))) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: "UP",
@@ -918,6 +1042,16 @@ function processStrategy(prices: { up: number; down: number }, timeRemaining: nu
             if (state.consecutiveHighProb.down >= CONFIG.CONSECUTIVE_HITS) {
                 console.log(`\n🎯 DOWN 連續 ${state.consecutiveHighProb.down} 次達標！`);
                 const order = simulateOrder("DOWN", prices.down, "STANDARD", timeRemaining);
+                if (!shouldEnterTrade("DOWN", prices.down, order.amount, CONFIG.HIGH_PROB_THRESHOLD, "standard entry")) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal("DOWN", prices, timeRemaining, "standard entry"))) {
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 state.currentRoundOrder = order;
                 state.currentPosition = {
                     side: "DOWN",
@@ -976,8 +1110,11 @@ function exportReport(): string {
     report += `\n## ⚙️ 策略參數\n\n`;
     report += `- 高勝率門檻: ${CONFIG.HIGH_PROB_THRESHOLD * 100}%\n`;
     report += `- 連續達標次數: ${CONFIG.CONSECUTIVE_HITS}\n`;
-    report += `- 標準倉位: 本金/${5 / CONFIG.STANDARD_MULTIPLIER}\n`;
-    report += `- 防禦倉位: 本金/${5 / CONFIG.DEFENSIVE_MULTIPLIER}\n`;
+    report += `- 標準倉位比例: ${(CONFIG.STANDARD_RATIO * 100).toFixed(2)}%\n`;
+    report += `- 防禦倉位比例: ${(CONFIG.DEFENSIVE_RATIO * 100).toFixed(2)}%\n`;
+    report += `- 單筆上限: $${CONFIG.MAX_BET_AMOUNT.toFixed(2)}\n`;
+    report += `- 最高入場價: ${(CONFIG.MAX_ENTRY_PRICE * 100).toFixed(2)}%\n`;
+    report += `- 最低潛在淨報酬: ${(CONFIG.MIN_NET_RETURN_RATIO * 100).toFixed(2)}%\n`;
     report += `- 停損閾值: ${CONFIG.STOP_LOSS_THRESHOLD * 100}%\n`;
     report += `- 最後N秒不停損: ${CONFIG.STOP_LOSS_HOLD_SECONDS} 秒\n`;
     report += `- 停損後等待重買: 最後 ${CONFIG.REBUY_WAIT_UNTIL_SECONDS} 秒\n`;
@@ -1014,8 +1151,8 @@ async function runSimulator() {
     console.log(`   初始本金: $${CONFIG.INITIAL_BALANCE}`);
     console.log(`   高勝率門檻: ${CONFIG.HIGH_PROB_THRESHOLD * 100}%`);
     console.log(`   連續達標: ${CONFIG.CONSECUTIVE_HITS} 次`);
-    console.log(`   標準倉位: $${(CONFIG.INITIAL_BALANCE / 5 * CONFIG.STANDARD_MULTIPLIER).toFixed(2)}`);
-    console.log(`   防禦倉位: $${(CONFIG.INITIAL_BALANCE / 5 * CONFIG.DEFENSIVE_MULTIPLIER).toFixed(2)}`);
+    console.log(`   標準倉位: ${(CONFIG.STANDARD_RATIO * 100).toFixed(2)}% / max $${CONFIG.MAX_BET_AMOUNT.toFixed(2)}`);
+    console.log(`   防禦倉位: ${(CONFIG.DEFENSIVE_RATIO * 100).toFixed(2)}% / max $${CONFIG.MAX_BET_AMOUNT.toFixed(2)}`);
     console.log(`\n🚨 停損機制: ✅ 已啟用 (閾值: ${CONFIG.STOP_LOSS_THRESHOLD * 100}%)`);
     console.log("\n按 Ctrl+C 停止\n");
     
@@ -1025,7 +1162,7 @@ async function runSimulator() {
         if (!state.currentMarket) return;
         
         const timeRemaining = getTimeRemaining(state.currentMarket);
-        processStrategy(prices, timeRemaining);
+        void processStrategy(prices, timeRemaining);
     };
     
     while (state.isRunning) {

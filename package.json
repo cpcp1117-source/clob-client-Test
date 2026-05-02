@@ -4,7 +4,11 @@
   "description": "基於 [@polymarket/clob-client](https://github.com/Polymarket/clob-client) 的自動交易系統。",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "simulate:btc": "tsx trading/strategy/btc-trading-simulator.ts",
+    "trade:btc": "tsx trading/strategy/btc-trading-live.ts",
+    "orchestra:codex": "powershell -ExecutionPolicy Bypass -File .agent/skills/codex-system/scripts/ask_codex.ps1",
+    "check:types": "tsc --noEmit --pretty false --ignoreConfig --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions trading/strategy/btc-trading-simulator.ts",
+    "test": "npm run check:types"
   },
   "repository": {
     "type": "git",

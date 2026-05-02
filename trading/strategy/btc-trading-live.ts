@@ -30,8 +30,16 @@ import { ctfAbi } from "../lib/abi/ctfAbi.ts";
 import { usdcAbi } from "../lib/abi/usdcAbi.ts";
 import { logger } from "../lib/logger.ts";
 import { sendDiscordNotification } from "./discord-notifier.ts";
+import { externalSignalEnabled, externalSignalFailOpen, getBtcEdgeSignal } from "./btc-edge-signal.ts";
 
 dotenvConfig({ path: resolve(import.meta.dirname, "../../.env") });
+
+function envNumber(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw === undefined || raw.trim() === "") return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+}
 
 // ============================================
 // 🎛️ 策略配置
@@ -44,19 +52,27 @@ const CONFIG = {
     // 資金管理
     // (注意: 實際初始本金會自動抓取當前錢包真實餘額，見程式碼第 270 行)
     INITIAL_BALANCE: 0,                        // 初始本金會被自動覆寫為真實錢包餘額
-    STANDARD_RATIO: 0.2,                       // 標準倉位比例 (1/5)
-    DEFENSIVE_RATIO: 0.1,                      // 防禦倉位比例 (1/10)
+    STANDARD_RATIO: envNumber("STANDARD_RATIO", 0.05),
+    DEFENSIVE_RATIO: envNumber("DEFENSIVE_RATIO", 0.03),
+    MAX_BET_AMOUNT: envNumber("MAX_BET_AMOUNT", 5),
+    MIN_CASH_RESERVE: envNumber("MIN_CASH_RESERVE", 2),
+    MAX_SESSION_LOSS_RATIO: envNumber("MAX_SESSION_LOSS_RATIO", 0.15),
     
     // 策略參數
-    HIGH_PROB_THRESHOLD: 0.85,                 // 85% 高勝率門檻
-    CONSECUTIVE_HITS: 5,                       // 連續達標次數
+    HIGH_PROB_THRESHOLD: envNumber("HIGH_PROB_THRESHOLD", 0.88),
+    FINAL_PROB_THRESHOLD: envNumber("FINAL_PROB_THRESHOLD", 0.90),
+    REBUY_PROB_THRESHOLD: envNumber("REBUY_PROB_THRESHOLD", 0.90),
+    CONSECUTIVE_HITS: envNumber("CONSECUTIVE_HITS", 6),
+    MAX_ENTRY_PRICE: envNumber("MAX_ENTRY_PRICE", 0.96),
+    MIN_NET_RETURN_RATIO: envNumber("MIN_NET_RETURN_RATIO", 0.04),
+    MIN_MODEL_EDGE: envNumber("MIN_MODEL_EDGE", 0.03),
     
     // 停損機制
-    STOP_LOSS_THRESHOLD: 0.15,                 // 價格下跌 15% 觸發停損
-    STOP_LOSS_CONFIRM_COUNT: 5,                // 需連續 N 次低於閾值才觸發停損
+    STOP_LOSS_THRESHOLD: envNumber("STOP_LOSS_THRESHOLD", 0.10),
+    STOP_LOSS_CONFIRM_COUNT: envNumber("STOP_LOSS_CONFIRM_COUNT", 4),
     STOP_LOSS_HOLD_SECONDS: 5,                 // 最後 N 秒不執行停損
     REBUY_WAIT_UNTIL_SECONDS: 5,               // 停損後等到最後 N 秒才能重新下單
-    MIN_REBUY_PROB: 0.85,                      // 重新買入最低勝率 85%
+    MIN_REBUY_PROB: envNumber("MIN_REBUY_PROB", envNumber("REBUY_PROB_THRESHOLD", 0.90)),
     MAX_REBUY_PER_ROUND: 1,                    // 每輪最多重新下單次數
     
     // 時間視窗 (秒)
@@ -1130,10 +1146,81 @@ function extractTokenIds(market: any): { up: string; down: string } | null {
 // ============================================
 function calculateBetAmount(orderType: "STANDARD" | "DEFENSIVE"): number {
     const ratio = orderType === "STANDARD" ? CONFIG.STANDARD_RATIO : CONFIG.DEFENSIVE_RATIO;
-    const amount = state.balance * ratio;
+    const tradableBalance = Math.max(0, state.balance - CONFIG.MIN_CASH_RESERVE);
+    const amount = Math.min(tradableBalance * ratio, CONFIG.MAX_BET_AMOUNT);
     
-    // 🛡️ 安全保護：最小開單金額為 $1 USDC
-    return Math.max(1, Math.floor(amount * 100) / 100);
+    if (amount < 1) return 0;
+    return Math.floor(amount * 100) / 100;
+}
+
+function sessionLossExceeded(): boolean {
+    if (CONFIG.INITIAL_BALANCE <= 0) return false;
+    const minBalance = CONFIG.INITIAL_BALANCE * (1 - CONFIG.MAX_SESSION_LOSS_RATIO);
+    return state.balance <= minBalance;
+}
+
+function hasEnoughNetReturn(price: number): boolean {
+    if (price <= 0) return false;
+    const netReturnRatio = (1 / price) - 1;
+    return netReturnRatio >= CONFIG.MIN_NET_RETURN_RATIO;
+}
+
+function shouldEnterTrade(
+    side: "UP" | "DOWN",
+    price: number,
+    amount: number,
+    minProbability: number,
+    reason: string
+): boolean {
+    if (sessionLossExceeded()) {
+        logger.warn(`   🛑 跳過 ${reason}: 本次執行虧損已達 ${(CONFIG.MAX_SESSION_LOSS_RATIO * 100).toFixed(1)}% 風控線`);
+        return false;
+    }
+    if (amount < 1) {
+        logger.warn(`   🛑 跳過 ${reason}: 可用下單金額不足 $1，保留現金 $${CONFIG.MIN_CASH_RESERVE.toFixed(2)}`);
+        return false;
+    }
+    if (price < minProbability) {
+        logger.info(`   ⏭️ 跳過 ${reason}: ${side} ${(price * 100).toFixed(2)}% 未達 ${(minProbability * 100).toFixed(2)}%`);
+        return false;
+    }
+    if (price > CONFIG.MAX_ENTRY_PRICE) {
+        logger.info(`   ⏭️ 跳過 ${reason}: 入場價 ${(price * 100).toFixed(2)}% 高於上限 ${(CONFIG.MAX_ENTRY_PRICE * 100).toFixed(2)}%`);
+        return false;
+    }
+    if (!hasEnoughNetReturn(price)) {
+        logger.info(`   ⏭️ 跳過 ${reason}: 潛在淨報酬低於 ${(CONFIG.MIN_NET_RETURN_RATIO * 100).toFixed(2)}%`);
+        return false;
+    }
+    return true;
+}
+
+async function passesExternalSignal(
+    side: "UP" | "DOWN",
+    prices: { up: number; down: number },
+    timeRemaining: number,
+    reason: string
+): Promise<boolean> {
+    if (!externalSignalEnabled()) return true;
+
+    const signal = await getBtcEdgeSignal(prices, timeRemaining);
+    if (!signal) {
+        const action = externalSignalFailOpen() ? "允許" : "阻擋";
+        logger.warn(`   ⚠️ 外部 BTC 訊號不可用，${action} ${reason}`);
+        return externalSignalFailOpen();
+    }
+
+    logger.info(`   📡 ${signal.reason}`);
+
+    if (signal.side !== side) {
+        logger.info(`   ⏭️ 跳過 ${reason}: 外部模型偏向 ${signal.side}，不是 ${side}`);
+        return false;
+    }
+    if (signal.edge < CONFIG.MIN_MODEL_EDGE) {
+        logger.info(`   ⏭️ 跳過 ${reason}: 模型 edge ${(signal.edge * 100).toFixed(2)}% 低於 ${(CONFIG.MIN_MODEL_EDGE * 100).toFixed(2)}%`);
+        return false;
+    }
+    return true;
 }
 
 // ============================================
@@ -1247,6 +1334,18 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
             state.rebuyCount++;
             const tokenId = higherSide === "UP" ? cachedTokenIds.up : cachedTokenIds.down;
             const amount = calculateBetAmount("DEFENSIVE");
+            if (!shouldEnterTrade(higherSide, higherPrice, amount, CONFIG.MIN_REBUY_PROB, "rebuy")) {
+                orderLock = false;
+                state.tradingState = TradingState.SKIPPED;
+                displayStatus(prices, timeRemaining);
+                return;
+            }
+            if (!(await passesExternalSignal(higherSide, prices, timeRemaining, "rebuy"))) {
+                orderLock = false;
+                state.tradingState = TradingState.SKIPPED;
+                displayStatus(prices, timeRemaining);
+                return;
+            }
             
             try {
                 const order = await executeRealOrder(
@@ -1304,6 +1403,18 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
                 logger.info(`   ⏭️ 監控期已跳過且勝率仍高於 80% (${(higherPrice * 100).toFixed(2)}%)，不執行決策下單`);
                 orderLock = false;
                 state.tradingState = TradingState.HOLDING; // 結束本輪決策
+                displayStatus(prices, timeRemaining);
+                return;
+            }
+            if (!shouldEnterTrade(higherSide, higherPrice, amount, CONFIG.FINAL_PROB_THRESHOLD, "final decision")) {
+                orderLock = false;
+                state.tradingState = TradingState.SKIPPED;
+                displayStatus(prices, timeRemaining);
+                return;
+            }
+            if (!(await passesExternalSignal(higherSide, prices, timeRemaining, "final decision"))) {
+                orderLock = false;
+                state.tradingState = TradingState.SKIPPED;
                 displayStatus(prices, timeRemaining);
                 return;
             }
@@ -1371,6 +1482,18 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
                 state.tradingState = TradingState.ORDERED;
                 logger.info(`\n🎯 UP 連續 ${state.consecutiveHighProb.up} 次達標！`);
                 const amount = calculateBetAmount("STANDARD");
+                if (!shouldEnterTrade("UP", prices.up, amount, CONFIG.HIGH_PROB_THRESHOLD, "standard entry")) {
+                    orderLock = false;
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal("UP", prices, timeRemaining, "standard entry"))) {
+                    orderLock = false;
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 
                 try {
                     const order = await executeRealOrder(
@@ -1411,6 +1534,18 @@ async function processStrategy(prices: { up: number; down: number }, timeRemaini
                 state.tradingState = TradingState.ORDERED;
                 logger.info(`\n🎯 DOWN 連續 ${state.consecutiveHighProb.down} 次達標！`);
                 const amount = calculateBetAmount("STANDARD");
+                if (!shouldEnterTrade("DOWN", prices.down, amount, CONFIG.HIGH_PROB_THRESHOLD, "standard entry")) {
+                    orderLock = false;
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
+                if (!(await passesExternalSignal("DOWN", prices, timeRemaining, "standard entry"))) {
+                    orderLock = false;
+                    state.tradingState = TradingState.SKIPPED;
+                    displayStatus(prices, timeRemaining);
+                    return;
+                }
                 
                 try {
                     const order = await executeRealOrder(
